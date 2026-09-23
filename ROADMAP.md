@@ -43,18 +43,34 @@ SSH agent is the Windows OpenSSH pipe / Pageant, or `$SSH_AUTH_SOCK` on Linux.
   stored as plain text under `%APPDATA%\skiff\configs\<host>\`, with
   added/removed counts on capture and unified diff between any two snapshots
 
-## Planned (rough priority order)
+## v0.3.0 — scoped (agreed 2026-09-23)
+
+Theme: **settings + safety**. Introduces the app-level settings store + a
+Settings dialog; several items ride on that foundation.
+
+1. **Host-color policies (customizable)** — the centerpiece. Decouple a colour's
+   *appearance* from its *behaviour*: a per-colour policy object in settings
+   decides AI on/off/ask, confirm-on-connect, confirm-each-command,
+   exclude-from-broadcast, etc. Per-host `aiAllowed` still overrides. Introduces
+   the settings store (`settings.json` + load/save IPC, `hosts.rs` is the
+   template) + Settings dialog.
+2. **Subnet-aware sidebar filter** — `10.20.0.0/16` as a filter expression;
+   extends `filterTree`. Low-risk.
+3. **Device-type profiles** — one dropdown (PAN-OS / Cisco IOS / Linux) bundling
+   pager+width presets, config-capture command, prompt quirks. Pairs with policies.
+4. **Dangerous-command guard** — warn before `rm -rf`, `reload`, `write erase`,
+   `shutdown`, etc.; stricter on coloured hosts. Rides on the colour policies.
+5. Small wins: **custom tab titles/rename**, **confirm-close on active session**,
+   **font zoom (Ctrl +/-)**.
+
+Deferred to **v0.3.x**: nested split layouts (the one large item — recursive
+layout tree replacing the single-orientation flat model).
+
+## Planned (backlog, rough priority)
 
 0. **Nested split layouts** — a pane full-height beside two stacked, arbitrary
-   trees. Needs a recursive layout tree (per-node direction + sizes) replacing
-   the current single-orientation flat model. Next release.
-
-0. **Host-color policies (settings)** — decouple a colour's *appearance* from its
-   *behaviour*. Today "red disables AI" is hardcoded; instead a per-colour policy
-   object (configured in app settings) decides: AI on/off/ask, confirm-on-connect,
-   confirm-each-command, exclude-from-broadcast, paste confirmation, auto-snapshot,
-   forced logging, tab badge. Per-host `aiAllowed` still overrides. Introduces
-   app-level settings storage + a settings UI (neither exists yet).
+   trees. Recursive layout tree (per-node direction + sizes) replacing the
+   current single-orientation flat model. v0.3.x.
 
 1. **Scheduled capture** — "connect nightly, snapshot config, disconnect":
    poor-man's RANCID. Composes from existing parts (connect, exec capture,
