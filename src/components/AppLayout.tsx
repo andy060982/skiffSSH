@@ -2,12 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Host, HostNode, Session, Transfer, TransferProgressEvent, WorkspaceView } from '../types'
 import {
   addFolder, allFolders, allHosts, countHosts, findHost, moveHost, reidentify,
-  removeFolder, removeHost, renameFolder, upsertHost,
+  effectiveHostColor, removeFolder, removeHost, renameFolder, setFolderColor, upsertHost,
 } from '../lib/tree'
 import { resolveStartupCommands } from '../lib/startupPresets'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { transfer as runTransfer } from '../lib/sftp'
-import { hostColorHex } from '../lib/hostColors'
+import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { clearLocal, emitLocal } from '../lib/localTerm'
 import { TitleBar } from './TitleBar'
 import { HostSidebar } from './HostSidebar'
@@ -130,11 +130,13 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     [sessions, activeId],
   )
 
-  /** Accent hex of the active session's host, for the wrong-window guard. */
-  const activeAccent = useMemo(
-    () => (active ? hostColorHex(findHost(hosts, active.hostId)?.color) : null),
+  /** Effective colour of the active session's host (own, else inherited from a
+   *  folder), for the wrong-window guard and the AI-off default. */
+  const activeColor = useMemo(
+    () => (active ? effectiveHostColor(hosts, active.hostId) : undefined),
     [active, hosts],
   )
+  const activeAccent = hostColorHex(activeColor)
 
   /* Remember which hosts were open, so a restart can pick them up again.
      Only host ids and view mode: a TCP connection cannot be serialised, so
@@ -768,6 +770,21 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           },
         },
         {
+          label: 'Set color…',
+          onSelect: () => {
+            // Second-level menu at the same anchor — same pattern as move-to.
+            setMenu({
+              x,
+              y,
+              items: HOST_COLORS.map((c) => ({
+                label: c.label,
+                onSelect: () =>
+                  persistHosts(setFolderColor(hostsRef.current, folderId, c.key)),
+              })),
+            })
+          },
+        },
+        {
           label: 'Delete folder (keep hosts)',
           danger: true,
           dividerBefore: true,
@@ -1083,9 +1100,9 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
 
         {showAi && (
           <AiPanel
-            key={active?.id}
             session={active}
             host={active ? findHost(hosts, active.hostId) : undefined}
+            effectiveColor={activeColor}
             onClose={() => setShowAi(false)}
           />
         )}

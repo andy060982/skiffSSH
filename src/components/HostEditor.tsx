@@ -91,7 +91,17 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
     draft.name.trim() !== '' && draft.hostname.trim() !== '' && draft.username.trim() !== ''
 
   const submit = async () => {
-    if (!valid) return
+    if (!valid) {
+      // Say WHAT is missing instead of a dead button that looks like the app
+      // ignored the click.
+      const missing = [
+        draft.name.trim() === '' && 'Name',
+        draft.hostname.trim() === '' && 'Hostname',
+        draft.username.trim() === '' && 'Username',
+      ].filter(Boolean)
+      setError(`Fill in required field(s): ${missing.join(', ')}`)
+      return
+    }
     setBusy(true)
     setError(null)
     try {
@@ -106,9 +116,9 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
       // can never disagree about what runs.
       onSave({
         ...draft,
-        // Clean once, here: drop blank lines and surrounding whitespace the
-        // free-typing textarea allowed while editing.
-        startupCommands: startup.map((c) => c.trim()).filter(Boolean),
+        // Clean once, here: trim, drop blank lines, and de-duplicate — the last
+        // also repairs any host whose commands were stacked by the old toggle.
+        startupCommands: [...new Set(startup.map((c) => c.trim()).filter(Boolean))],
         startupCommand: undefined,
         snippets: snippets.filter((sn) => sn.command.trim() !== ''),
       })
@@ -360,7 +370,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                     <option value="">—</option>
                     {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => (
                       <option key={d} value={d}>
-                        ⇧{d}
+                        ⌃⇧{d}
                       </option>
                     ))}
                   </select>
@@ -446,7 +456,10 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                       checked={on}
                       onChange={() =>
                         setStartup((list) =>
-                          on
+                          // Decide from the CURRENT list, not the render-time
+                          // `on`: a stale closure or an already-present command
+                          // must never stack a second (or fifth) copy.
+                          list.includes(preset.command)
                             ? list.filter((c) => c !== preset.command)
                             : [...list, preset.command],
                         )
@@ -642,7 +655,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           </button>
           <button
             type="button"
-            disabled={!valid || busy}
+            disabled={busy}
             onClick={() => void submit()}
             className="rounded border border-accent/60 bg-accent/15 px-3 py-1.5 text-[12.5px] font-medium text-accent transition-colors hover:bg-accent/25 disabled:opacity-40"
           >

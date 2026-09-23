@@ -4,6 +4,7 @@ import {
   TextSearch, X,
 } from 'lucide-react'
 import type { Host, Session } from '../types'
+import type { HostColor } from '../lib/hostColors'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { getTerm } from '../lib/termRegistry'
 import { scanForSecrets, type SecretHit } from '../lib/secretScan'
@@ -41,9 +42,11 @@ const PRESETS: { label: string; cfg: AiConfig }[] = [
 /** Whether the assistant may see this host's terminal output. Red-accented
  *  hosts (production, by this app's own convention) default to NO — sending a
  *  production firewall's session to any endpoint should be a deliberate act. */
-export function aiAllowedFor(host: Host | undefined): boolean {
+export function aiAllowedFor(host: Host | undefined, effectiveColor?: HostColor): boolean {
   if (!host) return false
-  return host.aiAllowed ?? host.color !== 'red'
+  // An explicit per-host choice wins; otherwise default off for red — whether
+  // the red is the host's own colour or inherited from its folder.
+  return host.aiAllowed ?? (effectiveColor ?? host.color) !== 'red'
 }
 
 /* ---------------------------------------------------------------------------
@@ -59,17 +62,42 @@ export function aiAllowedFor(host: Host | undefined): boolean {
 export function AiPanel({
   session,
   host,
+  effectiveColor,
   onClose,
 }: {
   session: Session | undefined
   host: Host | undefined
+  effectiveColor?: HostColor
   onClose: () => void
 }) {
   const [cfg, setCfg] = useState<AiConfig | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   const [keySaved, setKeySaved] = useState(false)
   const [keyDraft, setKeyDraft] = useState('')
-  const [messages, setMessages] = useState<Msg[]>([])
+  // One conversation per session id, so switching panes/sessions and coming
+  // back restores that session's thread instead of wiping it — while still
+  // never showing one session's history under another (no cross-host bleed).
+  const [threads, setThreads] = useState<Record<string, Msg[]>>({})
+  const emptyThread = useRef<Msg[]>([])
+  const sid = session?.id
+  const messages = (sid && threads[sid]) || emptyThread.current
+  // A ref so an in-flight stream lands in the session it started in, even if
+  // the user has switched away by the time deltas arrive.
+  const sidRef = useRef<string | undefined>(sid)
+  sidRef.current = sid
+  /** Update one session's thread by id (not necessarily the active one). */
+  const setThreadMsgs = useCallback(
+    (targetSid: string, updater: Msg[] | ((m: Msg[]) => Msg[])) => {
+      setThreads((prev) => ({
+        ...prev,
+        [targetSid]:
+          typeof updater === 'function'
+            ? (updater as (m: Msg[]) => Msg[])(prev[targetSid] ?? [])
+            : updater,
+      }))
+    },
+    [],
+  )
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   /** Held request awaiting the user's OK after a secret was detected in what
@@ -78,7 +106,7 @@ export function AiPanel({
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
 
-  const allowed = aiAllowedFor(host)
+  const allowed = aiAllowedFor(host, effectiveColor)
 
   /* Provider config: load once; missing config opens settings. */
   useEffect(() => {
@@ -116,17 +144,21 @@ export function AiPanel({
    *  clears the secret-warning gate below. */
   const dispatch = useCallback(
     async (thread: Msg[], systemContext: string) => {
+      // Bind this run to the session it started in, so deltas keep landing in
+      // the right thread even if the user switches away mid-stream.
+      const target = sidRef.current
+      if (!target) return
       // Drop any prior listener before registering a new one — a dispatch that
       // errored without ever emitting `done` would otherwise leak its ai://…
       // subscription until the panel unmounts.
       unlistenRef.current?.()
       unlistenRef.current = null
-      setMessages([...thread, { role: 'assistant', content: '' }])
+      setThreadMsgs(target, [...thread, { role: 'assistant', content: '' }])
       setStreaming(true)
       const runId = `ai-${Date.now()}`
       unlistenRef.current = await safeListen<AiEvent>(`ai://${runId}`, (ev) => {
         if (ev.error) {
-          setMessages((m) => {
+          setThreadMsgs(target, (m) => {
             const copy = [...m]
             copy[copy.length - 1] = {
               role: 'assistant',
@@ -135,7 +167,7 @@ export function AiPanel({
             return copy
           })
         } else if (ev.delta) {
-          setMessages((m) => {
+          setThreadMsgs(target, (m) => {
             const copy = [...m]
             copy[copy.length - 1] = {
               role: 'assistant',
@@ -163,13 +195,13 @@ export function AiPanel({
         setStreaming(false)
         unlistenRef.current?.()
         unlistenRef.current = null
-        setMessages((m) => [
+        setThreadMsgs(target, (m) => [
           ...m.slice(0, -1),
           { role: 'assistant', content: `⚠ ${e instanceof Error ? e.message : e}` },
         ])
       }
     },
-    [cfg],
+    [cfg, setThreadMsgs],
   )
 
   const send = useCallback(

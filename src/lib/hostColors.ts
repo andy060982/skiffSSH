@@ -11,15 +11,31 @@
  *  (these differ in lightness as well as hue). `none` is the default and paints
  *  nothing.
  */
-export type HostColor = 'none' | 'red' | 'amber' | 'green' | 'blue' | 'violet'
+export type HostColor =
+  | 'none'
+  | 'red'
+  | 'orange'
+  | 'amber'
+  | 'lime'
+  | 'green'
+  | 'cyan'
+  | 'blue'
+  | 'violet'
+  | 'pink'
+  | 'slate'
 
 export const HOST_COLORS: { key: HostColor; label: string; hex: string }[] = [
   { key: 'none', label: 'None', hex: 'transparent' },
   { key: 'red', label: 'Production', hex: '#e5484d' },
+  { key: 'orange', label: 'Orange', hex: '#f2760c' },
   { key: 'amber', label: 'Staging', hex: '#f2b25c' },
+  { key: 'lime', label: 'Lime', hex: '#9bd534' },
   { key: 'green', label: 'Lab', hex: '#4ec9a8' },
+  { key: 'cyan', label: 'Cyan', hex: '#2ec8d8' },
   { key: 'blue', label: 'Default', hex: '#4f9cf9' },
   { key: 'violet', label: 'Special', hex: '#b98bfa' },
+  { key: 'pink', label: 'Pink', hex: '#ff7ab2' },
+  { key: 'slate', label: 'Slate', hex: '#8b95a5' },
 ]
 
 const BY_KEY = new Map(HOST_COLORS.map((c) => [c.key, c.hex]))

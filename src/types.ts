@@ -82,6 +82,9 @@ export interface HostFolder {
   id: string
   name: string
   children: HostNode[]
+  /** Optional accent, shown as a coloured bar on the folder row — the same
+   *  wrong-window cue as a host's colour, applied to a whole group. */
+  color?: HostColor
 }
 
 export type HostNode = Host | HostFolder

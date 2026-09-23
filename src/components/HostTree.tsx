@@ -1,6 +1,7 @@
 import { ChevronRight, Folder, FolderOpen, KeyRound, Pencil, Server, UserRound, Wifi, WifiOff } from 'lucide-react'
 import { type Host, type HostNode, isFolder } from '../types'
 import { countHosts } from '../lib/tree'
+import { type HostColor, hostColorHex } from '../lib/hostColors'
 
 interface Props {
   nodes: HostNode[]
@@ -19,13 +20,16 @@ interface Props {
   /** Host ids with a live session, so the tree can say so. */
   openHostIds?: Set<string>
   activeHostId?: string
+  /** Colour inherited from an ancestor folder; a host/subfolder with no colour
+   *  of its own shows this instead. */
+  inheritedColor?: HostColor
 }
 
 /** Recursive tree. Indentation is applied via padding on the row rather than
  *  nested margins so the hover/selection highlight always spans the full
  *  sidebar width — nested containers would inset it one step per level. */
 export function HostTree({
-  nodes, depth = 0, expanded, onToggle, onOpen, onSelect, onEdit, onMenu, onFolderMenu, reachability, openHostIds, activeHostId,
+  nodes, depth = 0, expanded, onToggle, onOpen, onSelect, onEdit, onMenu, onFolderMenu, reachability, openHostIds, activeHostId, inheritedColor,
 }: Props) {
   return (
     <ul role="group" className="min-w-0">
@@ -39,7 +43,12 @@ export function HostTree({
                 e.preventDefault()
                 onFolderMenu(node.id, node.name, e.clientX, e.clientY)
               }}
-              style={{ paddingLeft: 8 + depth * 14 }}
+              style={{
+                paddingLeft: 8 + depth * 14,
+                boxShadow: hostColorHex(node.color ?? inheritedColor)
+                  ? `inset 3px 0 0 0 ${hostColorHex(node.color ?? inheritedColor)}`
+                  : undefined,
+              }}
               className="group flex h-7 w-full items-center gap-1.5 pr-2 text-left text-ink-dim transition-colors hover:bg-surface-2 hover:text-ink"
             >
               <ChevronRight
@@ -49,11 +58,18 @@ export function HostTree({
                 }`}
                 aria-hidden
               />
-              {expanded.has(node.id) ? (
-                <FolderOpen size={13} className="shrink-0 text-warn" aria-hidden />
-              ) : (
-                <Folder size={13} className="shrink-0 text-warn" aria-hidden />
-              )}
+              {(() => {
+                const fc = hostColorHex(node.color ?? inheritedColor)
+                const Icon = expanded.has(node.id) ? FolderOpen : Folder
+                return (
+                  <Icon
+                    size={13}
+                    className={`shrink-0 ${fc ? '' : 'text-warn'}`}
+                    style={fc ? { color: fc } : undefined}
+                    aria-hidden
+                  />
+                )
+              })()}
               <span className="truncate text-[12.5px]">{node.name}</span>
               <span className="ml-auto shrink-0 text-[10.5px] tabular-nums text-ink-faint opacity-0 transition-opacity group-hover:opacity-100">
                 {countHosts(node.children)}
@@ -74,6 +90,7 @@ export function HostTree({
                 reachability={reachability}
                 openHostIds={openHostIds}
                 activeHostId={activeHostId}
+                inheritedColor={node.color ?? inheritedColor}
               />
             )}
           </li>
@@ -89,6 +106,7 @@ export function HostTree({
               onMenu={onMenu}
               probe={reachability?.[node.id]}
               open={openHostIds?.has(node.id) ?? false}
+              inheritedColor={inheritedColor}
             />
           </li>
         ),
@@ -98,7 +116,7 @@ export function HostTree({
 }
 
 function HostRow({
-  host, depth, active, onOpen, onSelect, onEdit, onMenu, probe, open,
+  host, depth, active, onOpen, onSelect, onEdit, onMenu, probe, open, inheritedColor,
 }: {
   host: Host
   depth: number
@@ -109,7 +127,13 @@ function HostRow({
   onMenu: (h: Host, x: number, y: number) => void
   probe?: { ok: boolean; ms?: number }
   open: boolean
+  inheritedColor?: HostColor
 }) {
+  // Per-host accent: a coloured left bar so the environment (prod/lab/…) is
+  // visible in the list itself, not only as a frame on the active pane. Falls
+  // back to the colour inherited from an ancestor folder. The bar is always
+  // 3px — transparent when unset — so rows stay aligned.
+  const accent = hostColorHex(host.color ?? inheritedColor)
   return (
     <div
       role="button"
@@ -121,7 +145,12 @@ function HostRow({
         onMenu(host, e.clientX, e.clientY)
       }}
       onKeyDown={(e) => e.key === 'Enter' && onOpen(host)}
-      style={{ paddingLeft: 8 + depth * 14 + 14 }}
+      style={{
+        paddingLeft: 8 + depth * 14 + 14,
+        // Inset shadow rather than a border so the bar never shifts the row's
+        // contents and rows stay aligned with folders above them.
+        boxShadow: accent ? `inset 3px 0 0 0 ${accent}` : undefined,
+      }}
       title={
         open
           ? `${host.username}@${host.hostname}:${host.port} — session open, double-click to focus it`
@@ -135,7 +164,8 @@ function HostRow({
     >
       <Server
         size={13}
-        className={`shrink-0 ${active ? 'text-accent' : 'text-ink-faint'}`}
+        className={`shrink-0 ${active && !accent ? 'text-accent' : !accent ? 'text-ink-faint' : ''}`}
+        style={accent ? { color: accent } : undefined}
         aria-hidden
       />
       {/* A session already exists for this host. Without this cue the only way

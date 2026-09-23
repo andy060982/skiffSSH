@@ -1,4 +1,5 @@
 import { type HostFolder, type HostNode, isFolder } from '../types'
+import type { HostColor } from './hostColors'
 
 /** Depth-first prune: keep a host if it matches, keep a folder if its name
  *  matches or any descendant survives. Returns the pruned tree plus the ids of
@@ -155,6 +156,42 @@ export function renameFolder(nodes: HostNode[], folderId: string, name: string):
     if (!isFolder(n)) return n
     if (n.id === folderId) return { ...n, name }
     return { ...n, children: renameFolder(n.children, folderId, name) }
+  })
+}
+
+/** A host's effective colour: its own if set, else the nearest ancestor
+ *  folder's. Returns undefined when neither the host (nor a coloured ancestor)
+ *  is found. Used for the wrong-window frame and the AI-off default. */
+export function effectiveHostColor(nodes: HostNode[], hostId: string): HostColor | undefined {
+  const SEARCHING = Symbol('searching')
+  const walk = (
+    list: HostNode[],
+    inherited: HostColor | undefined,
+  ): HostColor | undefined | typeof SEARCHING => {
+    for (const n of list) {
+      if (isFolder(n)) {
+        const res = walk(n.children, n.color ?? inherited)
+        if (res !== SEARCHING) return res
+      } else if (n.id === hostId) {
+        return n.color ?? inherited
+      }
+    }
+    return SEARCHING
+  }
+  const r = walk(nodes, undefined)
+  return r === SEARCHING ? undefined : r
+}
+
+/** Set (or clear, with 'none'/undefined) a folder's accent colour. */
+export function setFolderColor(
+  nodes: HostNode[],
+  folderId: string,
+  color: HostColor | undefined,
+): HostNode[] {
+  return nodes.map((n) => {
+    if (!isFolder(n)) return n
+    if (n.id === folderId) return { ...n, color: color === 'none' ? undefined : color }
+    return { ...n, children: setFolderColor(n.children, folderId, color) }
   })
 }
 
