@@ -18,17 +18,9 @@ you don't.
 
 ## Screenshots
 
-<!--
-  Drop images in docs/screenshots/ and reference them with relative paths so
-  they travel with the repo (work in clones and offline). Uncomment as you add:
+![Host catalogue with folders, per-host accent colors, and PROD tags](docs/screenshots/01-hosts.png)
 
-![Terminal with split panes](docs/screenshots/terminal-split.png)
-![Dual-pane SFTP transfer](docs/screenshots/sftp.png)
-![Host-key verification prompt](docs/screenshots/host-key.png)
-![AI assistant suggesting a command](docs/screenshots/ai-panel.png)
--->
-
-_Screenshots coming soon._
+_More screenshots (terminal, SFTP, AI assistant) coming soon._
 
 ---
 
