@@ -378,10 +378,7 @@ async fn logs_list() -> CmdResult<Vec<utils::session_log::LogEntry>> {
 async fn open_logs_folder() -> CmdResult<()> {
     let dir = utils::session_log::logs_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::process::Command::new("explorer")
-        .arg(&dir)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    utils::platform::open_dir(&dir).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -403,18 +400,14 @@ async fn hosts_export() -> CmdResult<String> {
         .map_err(|e| e.to_string())?
         .ok_or("no host catalogue to export")?;
 
-    let docs = std::env::var_os("USERPROFILE")
-        .map(|p| std::path::PathBuf::from(p).join("Documents"))
-        .ok_or("cannot resolve Documents folder")?;
+    let docs = utils::platform::documents_dir().ok_or("cannot resolve Documents folder")?;
+    std::fs::create_dir_all(&docs).map_err(|e| e.to_string())?;
     let path = docs.join("skiff-hosts.json");
     let text = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
 
     // Reveal rather than open: the point is "here is the file to copy".
-    let _ = std::process::Command::new("explorer")
-        .arg("/select,")
-        .arg(&path)
-        .spawn();
+    let _ = utils::platform::reveal_file(&path);
     Ok(path.to_string_lossy().to_string())
 }
 

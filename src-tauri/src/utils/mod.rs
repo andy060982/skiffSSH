@@ -5,4 +5,5 @@ pub mod configs;
 pub mod hosts;
 pub mod known_hosts;
 pub mod nettools;
+pub mod platform;
 pub mod session_log;

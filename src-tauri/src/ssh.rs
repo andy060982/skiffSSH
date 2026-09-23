@@ -1263,37 +1263,66 @@ async fn agent_auth(
 ) -> Result<Option<russh::client::AuthResult>, SshError> {
     use russh::keys::agent::client::AgentClient;
 
-    // OpenSSH agent for Windows: fixed, documented pipe name.
-    if let Ok(mut agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
-        if let Ok(identities) = agent.request_identities().await {
-            for key in identities {
-                let result = handle
-                    .authenticate_publickey_with(username, key, hash_alg, &mut agent)
-                    .await
-                    .map_err(|e| SshError::AuthFailed(format!("agent signing failed: {e}")))?;
-                if matches!(result, russh::client::AuthResult::Success) {
-                    return Ok(Some(result));
-                }
+    // Windows ships the OpenSSH agent on a fixed pipe; Pageant serves the PuTTY
+    // crowd. On Unix the one agent socket is named by $SSH_AUTH_SOCK.
+    #[cfg(windows)]
+    {
+        if let Ok(mut agent) =
+            AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await
+        {
+            if let Some(r) = try_agent_identities(&mut agent, handle, username, hash_alg, "agent").await? {
+                return Ok(Some(r));
+            }
+        }
+
+        // Pageant (PuTTY). connect_pageant never fails to construct; a missing
+        // Pageant surfaces when the identity request errors, which lands us in
+        // the Ok(None) fall-through below.
+        let mut pageant = AgentClient::connect_pageant().await;
+        if let Some(r) = try_agent_identities(&mut pageant, handle, username, hash_alg, "pageant").await? {
+            return Ok(Some(r));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // $SSH_AUTH_SOCK — set by ssh-agent, gnome-keyring, 1Password, etc.
+        if let Ok(mut agent) = AgentClient::connect_env().await {
+            if let Some(r) = try_agent_identities(&mut agent, handle, username, hash_alg, "agent").await? {
+                return Ok(Some(r));
             }
         }
     }
 
-    // Pageant (PuTTY). connect_pageant never fails to construct; a missing
-    // Pageant surfaces when the identity request errors, which lands us in
-    // the Ok(None) fall-through below.
-    let mut pageant = AgentClient::connect_pageant().await;
-    if let Ok(identities) = pageant.request_identities().await {
-        for key in identities {
-            let result = handle
-                .authenticate_publickey_with(username, key, hash_alg, &mut pageant)
-                .await
-                .map_err(|e| SshError::AuthFailed(format!("pageant signing failed: {e}")))?;
-            if matches!(result, russh::client::AuthResult::Success) {
-                return Ok(Some(result));
-            }
+    Ok(None)
+}
+
+/// Offer each identity a connected agent holds to the server, signing with the
+/// agent. Returns `Ok(Some(..))` on the first accepted key, `Ok(None)` if the
+/// agent is unreachable or holds no accepted key. `label` names the agent in
+/// the error message so "agent signing failed" vs "pageant signing failed"
+/// still tells the user which one balked.
+async fn try_agent_identities(
+    agent: &mut russh::keys::agent::client::AgentClient<
+        impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    >,
+    handle: &mut Handle<ClientHandler>,
+    username: &str,
+    hash_alg: Option<russh::keys::HashAlg>,
+    label: &str,
+) -> Result<Option<russh::client::AuthResult>, SshError> {
+    let Ok(identities) = agent.request_identities().await else {
+        return Ok(None);
+    };
+    for key in identities {
+        let result = handle
+            .authenticate_publickey_with(username, key, hash_alg, agent)
+            .await
+            .map_err(|e| SshError::AuthFailed(format!("{label} signing failed: {e}")))?;
+        if matches!(result, russh::client::AuthResult::Success) {
+            return Ok(Some(result));
         }
     }
-
     Ok(None)
 }
 

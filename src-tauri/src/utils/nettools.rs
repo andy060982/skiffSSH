@@ -66,12 +66,37 @@ impl NetTools {
     ) -> Result<(), String> {
         validate_target(target)?;
 
+        // The built-ins differ per OS in both name and flags. All variants stay
+        // finite (a fixed count / hop cap) so a run can never hang the UI.
         let (program, args): (&str, Vec<String>) = match tool {
-            // -n 4: four echoes; -w 1500: per-reply wait. Finite by design.
-            "ping" => ("ping", vec!["-n".into(), "4".into(), "-w".into(), "1500".into(), target.into()]),
-            // -d: no reverse DNS per hop (the usual traceroute slowness);
-            // -h 20 -w 1000 caps the worst case around 20-40 s.
-            "traceroute" => ("tracert", vec!["-d".into(), "-h".into(), "20".into(), "-w".into(), "1000".into(), target.into()]),
+            "ping" => {
+                // -n/-c 4: four echoes. Windows -w is ms; Linux -W is seconds;
+                // macOS ping has no portable per-reply timeout flag, so rely on
+                // the fixed count there.
+                #[cfg(target_os = "windows")]
+                {
+                    ("ping", vec!["-n".into(), "4".into(), "-w".into(), "1500".into(), target.into()])
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    ("ping", vec!["-c".into(), "4".into(), target.into()])
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    ("ping", vec!["-c".into(), "4".into(), "-W".into(), "2".into(), target.into()])
+                }
+            }
+            "traceroute" => {
+                // No reverse DNS per hop (the usual slowness); cap at 20 hops.
+                #[cfg(target_os = "windows")]
+                {
+                    ("tracert", vec!["-d".into(), "-h".into(), "20".into(), "-w".into(), "1000".into(), target.into()])
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    ("traceroute", vec!["-n".into(), "-m".into(), "20".into(), "-w".into(), "1".into(), target.into()])
+                }
+            }
             other => return Err(format!("unknown tool: {other}")),
         };
 
