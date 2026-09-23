@@ -18,13 +18,12 @@ you don't.
 
 ## Screenshots
 
-![Live terminal session](docs/screenshots/02-terminal.png)
+![Split panes with the AI assistant suggesting read-only commands](docs/screenshots/05-split.png)
 
 | | |
 |---|---|
-| ![Host catalogue with folders, accent colors, and PROD tags](docs/screenshots/01-hosts.png) | ![Dual-pane SFTP transfer](docs/screenshots/03-sftp.png) |
-
-![AI assistant suggesting read-only commands as insertable chips](docs/screenshots/04-ai.png)
+| ![Host catalogue with folders, accent colors, and PROD tags](docs/screenshots/01-hosts.png) | ![Live terminal session](docs/screenshots/02-terminal.png) |
+| ![Dual-pane SFTP transfer](docs/screenshots/03-sftp.png) | ![AI assistant panel](docs/screenshots/04-ai.png) |
 
 ---
 
