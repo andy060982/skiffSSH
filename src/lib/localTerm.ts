@@ -1,0 +1,51 @@
+/** A tiny frontend-only channel for writing into a session's terminal pane.
+ *
+ *  Backend output arrives over the Tauri event `ssh://{id}`, but some text
+ *  originates in the webview — a connect failure, a local notice — and has no
+ *  business round-tripping through Rust just to be displayed.
+ *
+ *  Messages are buffered until a pane subscribes. That is the whole point: a
+ *  connect error frequently lands BEFORE TerminalPane has mounted and attached
+ *  its listener, and an unbuffered bus would drop exactly the message the user
+ *  most needs to see. */
+
+type Handler = (text: string) => void
+
+const subscribers = new Map<string, Set<Handler>>()
+const pending = new Map<string, string[]>()
+
+export function emitLocal(sessionId: string, text: string): void {
+  const subs = subscribers.get(sessionId)
+  if (subs && subs.size > 0) {
+    subs.forEach((h) => h(text))
+    return
+  }
+  const queue = pending.get(sessionId) ?? []
+  queue.push(text)
+  pending.set(sessionId, queue)
+}
+
+export function onLocal(sessionId: string, handler: Handler): () => void {
+  const subs = subscribers.get(sessionId) ?? new Set<Handler>()
+  subs.add(handler)
+  subscribers.set(sessionId, subs)
+
+  // Flush anything that arrived before this pane existed.
+  const queued = pending.get(sessionId)
+  if (queued?.length) {
+    pending.delete(sessionId)
+    queued.forEach((t) => handler(t))
+  }
+
+  return () => {
+    subs.delete(handler)
+    if (subs.size === 0) subscribers.delete(sessionId)
+  }
+}
+
+/** Drop any buffered text for a closed session so it cannot leak into a later
+ *  session that happens to reuse the id. */
+export function clearLocal(sessionId: string): void {
+  pending.delete(sessionId)
+  subscribers.delete(sessionId)
+}

@@ -1,0 +1,67 @@
+[package]
+name = "skiff"
+version = "0.1.0"
+description = "SSH and SFTP client"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "skiff_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure-Rust SSH. No libssh2/OpenSSL system dependency, so the Windows build
+# needs no vcpkg and CI stays reproducible. Pinned to the 0.54 line rather than
+# an exact patch: 0.54.6 requires libcrux-ml-kem 0.0.3, which is yanked.
+# default features pull aws-lc-rs, whose build script requires NASM on Windows.
+# "ring" is the pure-Rust alternative: no NASM, no C toolchain beyond MSVC,
+# and it keeps CI reproducible. Drop "rsa" and older servers stop working.
+russh = { version = "0.54", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "3.0.0"
+tokio = { version = "1.53.1", features = ["full"] }
+zeroize = "1.8.2"
+dashmap = "6.2.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+thiserror = "2.0.20"
+similar = "2.7.0"
+futures-util = "0.3.34"
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "rustls"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[profile.release]
+# Size-first, because a desktop SSH client is latency-bound on the network, not
+# on local CPU.
+opt-level = "s"     # "z" trades loop vectorisation for a little more size
+                    # reduction. Not benchmarked here — if you switch, measure
+                    # the SFTP copy loop before keeping it.
+lto = "fat"         # explicit; `true` means "fat" but reads ambiguously
+codegen-units = 1   # one unit = best cross-function inlining, slowest builds
+strip = true        # drops symbols; see the caveat below
+panic = "abort"     # no unwinding tables, no landing pads
+
+# CAVEAT, and it matters for this application specifically:
+#
+# `panic = "abort"` turns a panic in ANY task into immediate process death. The
+# SSH output pump and each transfer run in spawned tokio tasks; with unwinding,
+# a panic there kills one task and the app survives with a dead session. With
+# abort, one malformed packet takes down every other open connection too.
+#
+# That trade is acceptable only because the alternative — a half-initialised
+# session silently continuing — is worse for a tool that writes to production
+# network gear. Keep panics genuinely unreachable in the pump path, and prefer
+# returning SshError over unwrap() anywhere near protocol parsing.
+#
+# `strip = true` also means release crash dumps have no symbols. For an internal
+# build you want to debug, use the profile below instead: same optimisation,
+# symbols retained.
+
+[profile.release-debug]
+inherits = "release"
+strip = false
+debug = 1

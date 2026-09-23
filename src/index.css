@@ -1,0 +1,159 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Design tokens. Tailwind v4 is CSS-first: anything declared in @theme becomes
+   a utility (--color-surface-1 -> bg-surface-1, text-surface-1, border-surface-1).
+
+   Palette note: status is never encoded in red-vs-green alone. Hue pairs are
+   chosen to stay separable under deuteranopia/protanopia, and every status also
+   carries a distinct glyph shape so colour is reinforcement, not the signal.
+--------------------------------------------------------------------------- */
+@theme {
+  --color-surface-0: #0b0e14;
+  --color-surface-1: #0f131b;
+  --color-surface-2: #151a24;
+  --color-surface-3: #1c2331;
+  --color-surface-4: #253042;
+
+  --color-line: #222a38;
+  --color-line-strong: #2f3a4d;
+
+  --color-ink: #e6e9ef;
+  --color-ink-dim: #9aa5b8;
+  --color-ink-faint: #64708a;
+
+  --color-accent: #4f9cf9;
+  --color-accent-soft: #14304f;
+  --color-warn: #f2b25c;
+  --color-alert: #b98bfa;
+  --color-ok: #4f9cf9;
+
+  --font-mono: "Cascadia Code", "JetBrains Mono", "Consolas", ui-monospace, monospace;
+  --font-sans: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+
+  --radius-panel: 0.5rem;
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+
+  body {
+    margin: 0;
+    background-color: var(--color-surface-0);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;            /* the app manages its own scroll regions */
+  }
+
+  /* Desktop chrome: no text selection by default, re-enabled where it matters
+     (terminal output, file names). Stray selection highlights are the fastest
+     way to make a Tauri app feel like a web page. */
+  * { user-select: none; }
+  .selectable { user-select: text; }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-surface-4);
+    border-radius: 6px;
+    border: 2px solid var(--color-surface-1);
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--color-line-strong); }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: -2px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   xterm surface.
+
+   xterm paints its own background from the ITheme we pass it, so the wrapper
+   must not paint a second, subtly different one underneath — that is what
+   produces the faint rectangle around a terminal that "almost" matches the app.
+   The viewport is forced transparent and the background comes from exactly one
+   place: --color-surface-0, via buildTerminalTheme().
+--------------------------------------------------------------------------- */
+@layer components {
+  .xterm { height: 100%; }
+
+  .xterm .xterm-viewport {
+    background-color: transparent !important;
+    overflow-y: auto;
+  }
+
+  /* Slimmer than the app scrollbar: the terminal is dense and a 10px track
+     steals a column of text. */
+  .xterm .xterm-viewport::-webkit-scrollbar { width: 8px; }
+  .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+    background: var(--color-surface-4);
+    border: 2px solid transparent;
+    background-clip: content-box;
+    border-radius: 6px;
+  }
+
+  /* xterm renders its own focus treatment; the global outline would draw a box
+     around the whole grid on every click. */
+  .xterm .xterm-screen:focus-visible,
+  .xterm textarea:focus-visible { outline: none; }
+}
+
+/* ---------------------------------------------------------------------------
+   Drop-in sheet, used by the host-key prompt.
+
+   Written as plain CSS in a layer rather than a Tailwind keyframe token so the
+   animation is legible where it is used and cannot be tree-shaken by a utility
+   scan that never sees the class name in a template literal.
+
+   The overshoot curve (0.16, 1, 0.3, 1) is a decelerate-heavy ease: the sheet
+   arrives fast and settles, which reads as physical rather than as a fade.
+--------------------------------------------------------------------------- */
+@layer components {
+  @keyframes skiff-drop-in {
+    from {
+      opacity: 0;
+      transform: translateY(-1.25rem) scale(0.985);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes skiff-scrim-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+
+  .animate-drop-in {
+    animation: skiff-drop-in 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .animate-scrim-in {
+    animation: skiff-scrim-in 180ms ease-out both;
+  }
+
+  /* A modal that announces a possible man-in-the-middle should still appear
+     instantly for users who have asked for less motion. */
+  @media (prefers-reduced-motion: reduce) {
+    .animate-drop-in,
+    .animate-scrim-in {
+      animation-duration: 1ms;
+    }
+  }
+}
+
+/* While a pane-to-pane file drag is live, text selection is suspended
+   everywhere — the drag and the browser's selection engine otherwise fight
+   over the same pointer, highlighting filenames as the cursor sweeps rows.
+   The grabbing cursor doubles as feedback that a drag is in progress. */
+@layer components {
+  body.skiff-dragging,
+  body.skiff-dragging * {
+    user-select: none !important;
+    cursor: grabbing !important;
+  }
+}

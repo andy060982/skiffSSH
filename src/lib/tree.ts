@@ -1,0 +1,205 @@
+import { type HostFolder, type HostNode, isFolder } from '../types'
+
+/** Depth-first prune: keep a host if it matches, keep a folder if its name
+ *  matches or any descendant survives. Returns the pruned tree plus the ids of
+ *  every folder that must be force-expanded to reveal a match — searching a
+ *  collapsed tree is useless if the results stay hidden. */
+export function filterTree(
+  nodes: HostNode[],
+  query: string,
+): { tree: HostNode[]; expand: Set<string> } {
+  const q = query.trim().toLowerCase()
+  const expand = new Set<string>()
+  if (!q) return { tree: nodes, expand }
+
+  const matches = (n: HostNode) =>
+    n.kind === 'host'
+      ? n.name.toLowerCase().includes(q) ||
+        n.hostname.toLowerCase().includes(q) ||
+        n.username.toLowerCase().includes(q) ||
+        (n.tag?.toLowerCase().includes(q) ?? false)
+      : n.name.toLowerCase().includes(q)
+
+  const walk = (list: HostNode[]): HostNode[] =>
+    list.flatMap<HostNode>((node) => {
+      if (!isFolder(node)) return matches(node) ? [node] : []
+      const kids = walk(node.children)
+      if (kids.length === 0 && !matches(node)) return []
+      expand.add(node.id)
+      // A folder matching by its own name shows its full contents.
+      return [{ ...node, children: kids.length ? kids : node.children }]
+    })
+
+  return { tree: walk(nodes), expand }
+}
+
+/** Count hosts (not folders) beneath a node — used for the folder badge. */
+export function countHosts(nodes: HostNode[]): number {
+  return nodes.reduce(
+    (sum, n) => sum + (isFolder(n) ? countHosts(n.children) : 1),
+    0,
+  )
+}
+
+/** Collect every folder id, for expand-all / collapse-all. */
+export function allFolderIds(nodes: HostNode[]): string[] {
+  return nodes.flatMap((n) =>
+    isFolder(n) ? [n.id, ...allFolderIds(n.children)] : [],
+  )
+}
+
+/** Replace a host in place if its id already exists anywhere in the tree,
+ *  otherwise append it at the root.
+ *
+ *  In-place replacement matters: editing a host that lives three folders deep
+ *  must not silently relocate it to the top level, which is what a naive
+ *  "filter out, then push" would do. */
+export function upsertHost(nodes: HostNode[], host: HostNode & { kind: 'host' }): HostNode[] {
+  let replaced = false
+
+  const walk = (list: HostNode[]): HostNode[] =>
+    list.map((n) => {
+      if (isFolder(n)) return { ...n, children: walk(n.children) }
+      if (n.id === host.id) {
+        replaced = true
+        return host
+      }
+      return n
+    })
+
+  const next = walk(nodes)
+  return replaced ? next : [...next, host]
+}
+
+/** Remove a host by id, at any depth. Folders are left in place even if they
+ *  become empty — deleting a folder is a separate, explicit action. */
+export function removeHost(nodes: HostNode[], hostId: string): HostNode[] {
+  return nodes.flatMap<HostNode>((n) => {
+    if (isFolder(n)) return [{ ...n, children: removeHost(n.children, hostId) }]
+    return n.id === hostId ? [] : [n]
+  })
+}
+
+/** Find a host by id, at any depth. */
+export function findHost(
+  nodes: HostNode[],
+  hostId: string,
+): (HostNode & { kind: 'host' }) | undefined {
+  for (const n of nodes) {
+    if (isFolder(n)) {
+      const hit = findHost(n.children, hostId)
+      if (hit) return hit
+    } else if (n.id === hostId) {
+      return n
+    }
+  }
+  return undefined
+}
+
+/** Every host in the tree, flattened in display order — for pickers. */
+export function allHosts(nodes: HostNode[]): (HostNode & { kind: 'host' })[] {
+  return nodes.flatMap((n) => (isFolder(n) ? allHosts(n.children) : [n]))
+}
+
+/** Add an empty folder at the root. Root-level on purpose: nesting is created
+ *  by moving hosts, and a deep empty scaffold is clutter nobody asked for. */
+export function addFolder(nodes: HostNode[], name: string): HostNode[] {
+  return [
+    ...nodes,
+    { kind: 'folder', id: `f-${Date.now().toString(36)}`, name, children: [] },
+  ]
+}
+
+/** Move a host into a folder (or to the root with null), preserving the host
+ *  itself untouched. No-op if the host or target folder is missing. */
+export function moveHost(
+  nodes: HostNode[],
+  hostId: string,
+  targetFolderId: string | null,
+): HostNode[] {
+  const host = findHost(nodes, hostId)
+  if (!host) return nodes
+  const without = removeHost(nodes, hostId)
+
+  if (targetFolderId === null) return [...without, host]
+
+  let placed = false
+  const walk = (list: HostNode[]): HostNode[] =>
+    list.map((n) => {
+      if (!isFolder(n)) return n
+      if (n.id === targetFolderId) {
+        placed = true
+        return { ...n, children: [...n.children, host] }
+      }
+      return { ...n, children: walk(n.children) }
+    })
+  const next = walk(without)
+  // Target folder vanished between menu open and click: keep the host at root
+  // rather than silently deleting it.
+  return placed ? next : [...without, host]
+}
+
+/** Remove a folder. Its children are promoted to the parent level rather than
+ *  deleted — removing a folder must never remove hosts. */
+export function removeFolder(nodes: HostNode[], folderId: string): HostNode[] {
+  return nodes.flatMap<HostNode>((n) => {
+    if (!isFolder(n)) return [n]
+    if (n.id === folderId) return n.children
+    return [{ ...n, children: removeFolder(n.children, folderId) }]
+  })
+}
+
+/** Rename a folder in place. */
+export function renameFolder(nodes: HostNode[], folderId: string, name: string): HostNode[] {
+  return nodes.map((n) => {
+    if (!isFolder(n)) return n
+    if (n.id === folderId) return { ...n, name }
+    return { ...n, children: renameFolder(n.children, folderId, name) }
+  })
+}
+
+/** All folders flattened, for "move to" pickers. */
+export function allFolders(nodes: HostNode[]): HostFolder[] {
+  return nodes.flatMap((n) =>
+    isFolder(n) ? [n, ...allFolders(n.children)] : [],
+  )
+}
+
+/** Prepare imported nodes for merging into an existing catalogue.
+ *
+ *  Any node whose id already exists (at any depth, host or folder) gets a
+ *  fresh id. Skipping duplicates instead would silently drop nested hosts,
+ *  and keeping them would corrupt the tree: duplicate ids break findHost,
+ *  folder-move targets, and React keys all at once. Imported hosts have no
+ *  saved credential on this machine either way, so a new id costs nothing.
+ */
+export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode[] {
+  const taken = new Set<string>()
+  const collect = (list: HostNode[]) => {
+    for (const n of list) {
+      taken.add(n.id)
+      if (isFolder(n)) collect(n.children)
+    }
+  }
+  collect(existing)
+
+  let counter = 0
+  const freshId = (prefix: string) => {
+    let id: string
+    do {
+      id = `${prefix}-imp-${Date.now().toString(36)}-${counter++}`
+    } while (taken.has(id))
+    taken.add(id)
+    return id
+  }
+
+  const walk = (list: HostNode[]): HostNode[] =>
+    list.map((n) => {
+      const id = taken.has(n.id) ? freshId(isFolder(n) ? 'f' : 'h') : (taken.add(n.id), n.id)
+      return isFolder(n)
+        ? { ...n, id, children: walk(n.children) }
+        : { ...n, id }
+    })
+
+  return walk(imported)
+}

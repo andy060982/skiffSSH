@@ -1,0 +1,467 @@
+//! Per-session transcript logging.
+//!
+//! Every byte the remote sends is appended to a file as it arrives, so a
+//! transcript survives a dropped connection, a killed process, or a crash —
+//! whatever was already written is already on disk. There is no "save on exit"
+//! step that a crash could skip.
+//!
+//! # What gets logged, and the honest limitation
+//!
+//! The stream is written as readable text with ANSI control sequences removed.
+//! For an interactive shell that yields exactly what you want: your typed
+//! commands (echoed back by the remote) interleaved with their output.
+//!
+//! It is lossy for full-screen programs. `vim`, `top`, or a pager redraw the
+//! screen by repositioning the cursor, and a linear transcript cannot represent
+//! that — expect those sections to read as a stream of partial redraws. That is
+//! an inherent property of flattening a 2D terminal into a 1D log, not a bug to
+//! fix here.
+//!
+//! Passwords typed at a remote prompt are not echoed by the remote, so they do
+//! not appear. Anything you *see* on screen, however, is written to disk in
+//! plaintext — this file is as sensitive as the session was.
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::known_hosts::KnownHostsError;
+
+/// `%APPDATA%\skiff\logs`
+pub fn logs_dir() -> Result<PathBuf, KnownHostsError> {
+    let store = super::known_hosts::store_path()?;
+    Ok(store
+        .parent()
+        .ok_or(KnownHostsError::NoAppDataDir)?
+        .join("logs"))
+}
+
+/// Civil date from a Unix timestamp, so filenames sort chronologically and are
+/// readable without a converter. Hinnant's algorithm; avoids pulling in chrono
+/// for what is ultimately one format string.
+/// Public alias so sibling modules (config snapshots) share the same
+/// filename convention instead of inventing a second timestamp format.
+pub fn timestamp_for(secs: u64) -> String {
+    timestamp_name(secs)
+}
+
+fn timestamp_name(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        y,
+        m,
+        d,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// Filesystem-safe form of a host label.
+fn slug(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+pub struct SessionLog {
+    file: File,
+    path: PathBuf,
+    /// Carries a trailing ESC across chunk boundaries: a control sequence can
+    /// be split between two reads, and a stripper with no memory would emit the
+    /// tail of it as text.
+    partial: Vec<u8>,
+}
+
+impl SessionLog {
+    /// Open a transcript for one session. Failure is non-fatal to the caller —
+    /// losing a log must never take down a working connection.
+    pub fn create(host: &str, username: &str) -> Result<Self, KnownHostsError> {
+        let dir = logs_dir()?;
+        std::fs::create_dir_all(&dir).map_err(|source| KnownHostsError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let path = dir.join(format!("{}_{}.log", slug(host), timestamp_name(now)));
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| KnownHostsError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+        let _ = writeln!(
+            file,
+            "=== skiff session: {username}@{host} started {} UTC ===",
+            timestamp_name(now)
+        );
+
+        Ok(Self {
+            file,
+            path,
+            partial: Vec::new(),
+        })
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    /// Append a chunk, stripping terminal control sequences.
+    ///
+    /// Flushed on every call rather than buffered: transcript durability is the
+    /// entire point, and terminal output is far too low-volume for the syscall
+    /// to matter.
+    pub fn append(&mut self, chunk: &[u8]) {
+        let mut buf = std::mem::take(&mut self.partial);
+        buf.extend_from_slice(chunk);
+
+        let (text, leftover) = strip_ansi(&buf);
+        self.partial = leftover;
+
+        if !text.is_empty() {
+            let _ = self.file.write_all(&text);
+            let _ = self.file.flush();
+        }
+    }
+
+    pub fn footer(&mut self, reason: &str) {
+        let _ = writeln!(self.file, "\n=== session ended: {reason} ===");
+        let _ = self.file.flush();
+    }
+}
+
+/// Remove ANSI/VT control sequences, returning (clean bytes, unconsumed tail).
+///
+/// The tail matters: if the chunk ends mid-sequence, those bytes are handed
+/// back so the next call can finish parsing them rather than leaking escape
+/// codes into the transcript.
+pub(crate) fn strip_ansi(input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < input.len() {
+        let b = input[i];
+
+        if b == 0x1b {
+            // CSI: ESC [ ... final byte in 0x40..=0x7e
+            if i + 1 >= input.len() {
+                return (out, input[i..].to_vec());
+            }
+            match input[i + 1] {
+                b'[' => {
+                    let mut j = i + 2;
+                    while j < input.len() && !(0x40..=0x7e).contains(&input[j]) {
+                        j += 1;
+                    }
+                    if j >= input.len() {
+                        return (out, input[i..].to_vec());
+                    }
+                    i = j + 1;
+                }
+                // OSC: ESC ] ... terminated by BEL or ESC \
+                b']' => {
+                    let mut j = i + 2;
+                    while j < input.len() {
+                        if input[j] == 0x07 {
+                            j += 1;
+                            break;
+                        }
+                        if input[j] == 0x1b && j + 1 < input.len() && input[j + 1] == b'\\' {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if j >= input.len() && !input.ends_with(&[0x07]) {
+                        return (out, input[i..].to_vec());
+                    }
+                    i = j;
+                }
+                // Two-byte escapes (ESC =, ESC >, ESC M, charset selection, ...)
+                _ => i += 2,
+            }
+            continue;
+        }
+
+        // Drop the carriage return of CRLF; keep lone CR out too, since a
+        // transcript has no cursor to move.
+        if b == b'\r' {
+            i += 1;
+            continue;
+        }
+
+        // Keep printable text, newlines, and tabs; drop other C0 controls
+        // (BEL, backspace and friends would render as noise).
+        if b == b'\n' || b == b'\t' || b >= 0x20 {
+            out.push(b);
+        }
+        i += 1;
+    }
+
+    (out, Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_colour_and_keeps_text() {
+        let (out, rest) = strip_ansi(b"\x1b[1;32mhello\x1b[0m world\r\n");
+        assert_eq!(String::from_utf8_lossy(&out), "hello world\n");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn carries_split_sequence_across_chunks() {
+        // Sequence cut in half by a chunk boundary.
+        let (out1, rest1) = strip_ansi(b"abc\x1b[3");
+        assert_eq!(String::from_utf8_lossy(&out1), "abc");
+        assert!(!rest1.is_empty(), "incomplete sequence is carried forward");
+
+        let mut joined = rest1;
+        joined.extend_from_slice(b"1mdef");
+        let (out2, rest2) = strip_ansi(&joined);
+        assert_eq!(String::from_utf8_lossy(&out2), "def");
+        assert!(rest2.is_empty());
+    }
+
+    #[test]
+    fn strips_osc_title_sequences() {
+        let (out, _) = strip_ansi(b"\x1b]0;my title\x07prompt$ ");
+        assert_eq!(String::from_utf8_lossy(&out), "prompt$ ");
+    }
+
+    #[test]
+    fn timestamp_is_readable_and_sorts() {
+        // 2026-09-17T12:00:00Z
+        let name = timestamp_name(1_789_646_400);
+        assert_eq!(&name[..8], "20260917");
+        assert!(timestamp_name(1_789_646_400) < timestamp_name(1_789_732_800));
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+
+/// Tail of the most recent transcript for a host.
+///
+/// This is the only form of "session history" available on appliances. A Palo
+/// Alto or a switch cannot run tmux, so nothing on the remote survives the
+/// connection dropping — but the transcript does, and replaying its tail into a
+/// reconnected tab restores the one thing that actually matters there: what you
+/// ran and what it said.
+///
+/// Returns None when the host has no prior transcript.
+pub fn latest_transcript(host: &str, max_bytes: usize) -> Result<Option<String>, KnownHostsError> {
+    let dir = match logs_dir() {
+        Ok(d) if d.exists() => d,
+        _ => return Ok(None),
+    };
+
+    let prefix = format!("{}_", slug(host));
+
+    // Newest by modified time rather than by filename: a clock change or a
+    // manually copied file would break lexical ordering, and picking the wrong
+    // transcript silently shows the user someone else's session.
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let entries = std::fs::read_dir(&dir).map_err(|source| KnownHostsError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) || !name.ends_with(".log") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.len() == 0 {
+            continue; // an aborted session has nothing to replay
+        }
+        let Ok(modified) = meta.modified() else { continue };
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+
+    let Some((_, path)) = newest else {
+        return Ok(None);
+    };
+
+    let bytes = std::fs::read(&path).map_err(|source| KnownHostsError::Io {
+        path: path.clone(),
+        source,
+    })?;
+
+    // Take the tail, then discard the first partial line so the replay never
+    // starts mid-word.
+    let start = bytes.len().saturating_sub(max_bytes);
+    let slice = &bytes[start..];
+    let slice = if start > 0 {
+        match slice.iter().position(|&b| b == b'\n') {
+            Some(i) => &slice[i + 1..],
+            None => slice,
+        }
+    } else {
+        slice
+    };
+
+    Ok(Some(String::from_utf8_lossy(slice).to_string()))
+}
+
+/* -------------------------------------------------------------------------- */
+
+/// Delete old transcripts.
+///
+/// These files hold plaintext records of production firewall sessions, so
+/// letting them accumulate forever is a quiet liability. Two independent caps,
+/// whichever removes more:
+///   * anything older than `max_age_days`
+///   * beyond `max_files`, the oldest first
+///
+/// Best-effort: a file that will not delete (locked, permissions) is skipped,
+/// never fatal. Returns how many were removed, for the startup log line.
+pub fn prune(max_age_days: u64, max_files: usize) -> usize {
+    let dir = match logs_dir() {
+        Ok(d) if d.exists() => d,
+        _ => return 0,
+    };
+
+    let now = SystemTime::now();
+    let max_age = std::time::Duration::from_secs(max_age_days * 86_400);
+
+    // (modified, path) for every transcript, newest first.
+    let mut logs: Vec<(SystemTime, PathBuf)> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.ends_with(".log")
+            })
+            .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, e.path())))
+            .collect(),
+        Err(_) => return 0,
+    };
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut removed = 0;
+    for (i, (modified, path)) in logs.iter().enumerate() {
+        let too_old = now.duration_since(*modified).map(|age| age > max_age).unwrap_or(false);
+        let over_count = i >= max_files;
+        if (too_old || over_count) && std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/* -------------------------------------------------------------------------- */
+
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    /// Bare filename, e.g. "192.0.2.10_20260918-141530.log". Also the id used
+    /// by `read_log`; never a path, so it cannot be pointed outside the dir.
+    pub name: String,
+    /// Host slug parsed back out of the filename for grouping in the UI.
+    pub host: String,
+    /// Unix epoch seconds parsed from the filename's timestamp, for sorting and
+    /// display without opening the file.
+    pub started: Option<u64>,
+    pub bytes: u64,
+}
+
+/// List transcripts, newest first. Empty when there are none.
+pub fn list() -> Result<Vec<LogEntry>, KnownHostsError> {
+    let dir = match logs_dir() {
+        Ok(d) if d.exists() => d,
+        _ => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|source| KnownHostsError::Io {
+        path: dir.clone(),
+        source,
+    })? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".log") {
+            continue;
+        }
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+
+        // Filename shape is "<host>_<YYYYMMDD-HHMMSS>.log". Split on the LAST
+        // underscore so hosts containing underscores (slugged dots, etc.) keep
+        // their name intact.
+        let stem = name.trim_end_matches(".log");
+        let (host, started) = match stem.rfind('_') {
+            Some(i) => (stem[..i].to_string(), parse_stamp(&stem[i + 1..])),
+            None => (stem.to_string(), None),
+        };
+        out.push(LogEntry { name, host, started, bytes });
+    }
+
+    out.sort_by(|a, b| b.started.cmp(&a.started));
+    Ok(out)
+}
+
+/// Read one transcript by name. Rejects anything that is not a bare filename,
+/// so a crafted name cannot escape the logs directory.
+pub fn read_log(name: &str) -> Result<String, KnownHostsError> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") || !name.ends_with(".log") {
+        return Err(KnownHostsError::Parse(format!("invalid log name: {name}")));
+    }
+    let path = logs_dir()?.join(name);
+    std::fs::read_to_string(&path).map_err(|source| KnownHostsError::Io { path, source })
+}
+
+/// Inverse of `timestamp_name`: "YYYYMMDD-HHMMSS" back to epoch seconds.
+fn parse_stamp(s: &str) -> Option<u64> {
+    let (date, time) = s.split_once('-')?;
+    if date.len() != 8 || time.len() != 6 {
+        return None;
+    }
+    let y: i64 = date[0..4].parse().ok()?;
+    let mo: i64 = date[4..6].parse().ok()?;
+    let d: i64 = date[6..8].parse().ok()?;
+    let h: u64 = time[0..2].parse().ok()?;
+    let mi: u64 = time[2..4].parse().ok()?;
+    let se: u64 = time[4..6].parse().ok()?;
+
+    // Days since epoch (Howard Hinnant's days_from_civil).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = (if yy >= 0 { yy } else { yy - 399 }) / 400;
+    let yoe = (yy - era * 400) as i64;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days as u64) * 86_400 + h * 3600 + mi * 60 + se)
+}
