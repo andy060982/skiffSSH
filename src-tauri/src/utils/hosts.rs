@@ -43,8 +43,21 @@ pub fn load() -> Result<Option<Value>, KnownHostsError> {
 
     // A corrupt file must not brick the app. Report it as absent and let the
     // next save overwrite; the alternative is a user who cannot start the
-    // program and cannot reach the UI that would fix it.
-    Ok(serde_json::from_str(&text).ok())
+    // program and cannot reach the UI that would fix it. Before treating it as
+    // absent, preserve the original bytes to `hosts.json.corrupt` so a bad
+    // hand-edit is recoverable rather than silently discarded on the next save.
+    match serde_json::from_str(&text) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => {
+            let backup = path.with_extension("json.corrupt");
+            let _ = std::fs::write(&backup, &text);
+            eprintln!(
+                "skiff: hosts.json is not valid JSON; backed up to {} and starting from defaults",
+                backup.display()
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Write the catalogue atomically.

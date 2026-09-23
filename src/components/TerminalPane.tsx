@@ -148,7 +148,10 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       void navigator.clipboard
         .readText()
         .then((text) => {
-          if (text) send(Array.from(encoder.encode(text)))
+          // term.paste (not a raw send) so xterm applies bracketed-paste
+          // framing when the remote app requested it — a multi-line payload
+          // arrives inert for review instead of auto-running line by line.
+          if (text) term.paste(text)
         })
         .catch(() => {
           term.write('\r\n\x1b[38;2;242;178;92m● clipboard read blocked\x1b[0m\r\n')
@@ -187,7 +190,9 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
         void navigator.clipboard
           .readText()
           .then((text) => {
-            if (text) send(Array.from(encoder.encode(text)))
+            // Bracketed-paste framing via term.paste — see the context-menu
+            // paste above for why a raw send is unsafe here.
+            if (text) term.paste(text)
           })
           .catch(() => {
             // Clipboard read can be denied by the webview; say so rather than

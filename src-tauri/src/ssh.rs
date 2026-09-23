@@ -738,8 +738,19 @@ impl Registry {
 
         let mut total = 0u64;
         let mut failed: Vec<String> = Vec::new();
+        // Bound the walk so a malicious or misconfigured server advertising a
+        // pathologically deep/wide tree cannot grow the worklist without limit.
+        const MAX_DIRS: usize = 50_000;
+        let mut visited = 0usize;
         let mut dirs = vec![(remote.to_string(), local.to_string())];
         while let Some((rdir, ldir)) = dirs.pop() {
+            visited += 1;
+            if visited > MAX_DIRS {
+                failed.push(format!(
+                    "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
+                ));
+                break;
+            }
             tokio::fs::create_dir_all(&ldir).await?;
             for entry in sftp.read_dir(&rdir).await? {
                 let name = entry.file_name();
@@ -806,8 +817,17 @@ impl Registry {
 
         let mut total = 0u64;
         let mut failed: Vec<String> = Vec::new();
+        const MAX_DIRS: usize = 50_000;
+        let mut visited = 0usize;
         let mut dirs = vec![(local.to_string(), remote.to_string())];
         while let Some((ldir, rdir)) = dirs.pop() {
+            visited += 1;
+            if visited > MAX_DIRS {
+                failed.push(format!(
+                    "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
+                ));
+                break;
+            }
             // create_dir on an existing directory is an error over SFTP; ignore
             // it so re-uploading into a partially-present tree just works.
             let _ = sftp.create_dir(&rdir).await;
@@ -1293,6 +1313,20 @@ fn safe_local_component(name: &str) -> bool {
         && !name.contains('\\')
         && !name.contains(':') // drive letters / ADS on Windows
         && !name.contains('\0')
+        && !is_windows_reserved(name)
+}
+
+/// True for Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9),
+/// matched case-insensitively and ignoring any extension — `NUL.txt` is still
+/// the NUL device. Creating such a file fails with a confusing OS error, so we
+/// reject the name up front and report it as skipped instead.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
 }
 
 /// Copy one remote file to a local path, streaming with progress.
@@ -1520,5 +1554,18 @@ mod tests {
         assert!(!safe_local_component("..\\Windows\\evil"));
         assert!(!safe_local_component("sub/dir"));
         assert!(!safe_local_component("C:evil")); // drive-relative
+    }
+
+    #[test]
+    fn rejects_windows_reserved_names() {
+        assert!(!safe_local_component("CON"));
+        assert!(!safe_local_component("nul")); // case-insensitive
+        assert!(!safe_local_component("NUL.txt")); // extension ignored
+        assert!(!safe_local_component("COM1"));
+        assert!(!safe_local_component("LPT9"));
+        // Names that merely start with a reserved stem are fine.
+        assert!(safe_local_component("console.log"));
+        assert!(safe_local_component("com10"));
+        assert!(safe_local_component("nullable.rs"));
     }
 }

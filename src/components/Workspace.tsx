@@ -160,6 +160,7 @@ export function Workspace({
         {session.view === 'sftp' && (
           <div className="absolute inset-0">
             <SftpView
+              key={session.id}
               session={session}
               onStartTransfer={onStartTransfer}
               savedPaths={sftpPaths[session.id]}

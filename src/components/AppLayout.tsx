@@ -799,12 +799,16 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         label: 'Export hosts…',
         dividerBefore: true,
         onSelect: () =>
-          void safeInvoke<string>('hosts_export').then((p) => {
-            if (p) window.alert(`Host catalogue exported to:
+          void safeInvoke<string>('hosts_export')
+            .then((p) => {
+              if (p) window.alert(`Host catalogue exported to:
 ${p}
 
 Passwords are NOT included — they stay in Windows Credential Manager.`)
-          }),
+            })
+            .catch((err) =>
+              window.alert(`Export failed: ${err instanceof Error ? err.message : err}`),
+            ),
       },
       {
         label: 'Import hosts…',
@@ -1079,6 +1083,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
 
         {showAi && (
           <AiPanel
+            key={active?.id}
             session={active}
             host={active ? findHost(hosts, active.hostId) : undefined}
             onClose={() => setShowAi(false)}

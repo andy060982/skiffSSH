@@ -116,6 +116,11 @@ export function AiPanel({
    *  clears the secret-warning gate below. */
   const dispatch = useCallback(
     async (thread: Msg[], systemContext: string) => {
+      // Drop any prior listener before registering a new one — a dispatch that
+      // errored without ever emitting `done` would otherwise leak its ai://…
+      // subscription until the panel unmounts.
+      unlistenRef.current?.()
+      unlistenRef.current = null
       setMessages([...thread, { role: 'assistant', content: '' }])
       setStreaming(true)
       const runId = `ai-${Date.now()}`
@@ -156,6 +161,8 @@ export function AiPanel({
         })
       } catch (e) {
         setStreaming(false)
+        unlistenRef.current?.()
+        unlistenRef.current = null
         setMessages((m) => [
           ...m.slice(0, -1),
           { role: 'assistant', content: `⚠ ${e instanceof Error ? e.message : e}` },
@@ -167,7 +174,10 @@ export function AiPanel({
 
   const send = useCallback(
     async (text: string) => {
-      if (!cfg || !session || !host || streaming || !text.trim()) return
+      // `allowed` is normally enforced by which branch renders the input, but
+      // gate the sender explicitly too so a red/prod host can never have its
+      // context sent to a provider, whatever calls send().
+      if (!cfg || !session || !host || !allowed || streaming || !text.trim()) return
       const userMsg: Msg = { role: 'user', content: text.trim() }
       const thread = [...messages, userMsg]
       setInput('')
@@ -198,7 +208,7 @@ export function AiPanel({
       }
       void dispatch(thread, systemContext)
     },
-    [cfg, session, host, streaming, messages, dispatch],
+    [cfg, session, host, allowed, streaming, messages, dispatch],
   )
 
   const explainSelection = () => {

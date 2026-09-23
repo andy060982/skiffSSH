@@ -233,7 +233,9 @@ export function SftpView({
         const name = p.split(/[\\/]/).filter(Boolean).pop() ?? p
         return { name, local: p, remote: joinPath('remote', remoteRef.current, name) }
       })
-      onStartTransfer(session.id, 'upload', jobs)
+      // Route through the shared guard so an Explorer drop honours the same
+      // overwrite prompt and unsafe-name check as an in-app transfer.
+      void confirmAndTransfer('upload', jobs)
     }).then((fn) => {
       if (dead) fn()
       else un = fn
@@ -245,24 +247,28 @@ export function SftpView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.id])
 
-  const start = async (side: PaneSide, names: string[]) => {
-    const direction = side === 'local' ? 'upload' : 'download'
-    // Downloads turn a server-chosen name into a LOCAL path. Reject any name
-    // that is not a plain component so a malicious server cannot write outside
-    // the target folder (the backend enforces this too; this is the friendly
-    // front-line message). Uploads are safe — the remote side is the server's
-    // own filesystem — but guarding both keeps the rule simple.
-    const unsafe = names.filter((n) => /[\/]/.test(n) || n === '..' || n.includes(':'))
+  // Single choke point every transfer passes through — the in-app pane drag,
+  // a pane menu "Transfer", and an Explorer drop all funnel here so none can
+  // skip the unsafe-name check or silently clobber a file.
+  const confirmAndTransfer = async (
+    direction: 'upload' | 'download',
+    jobs: { name: string; local: string; remote: string }[],
+  ) => {
+    // A download turns a server-chosen name into a LOCAL path. Reject any name
+    // that is not a plain component — EITHER separator (`\` is the traversal
+    // char on the Windows local side), `.`/`..`, or a drive-letter `:` — so a
+    // malicious server cannot write outside the target folder. The backend
+    // enforces this too; this is the friendly front-line message. Uploads are
+    // safe (remote is the server's own fs) but guarding both keeps the rule
+    // simple.
+    const unsafe = jobs.filter(
+      (j) => /[\\/]/.test(j.name) || j.name === '.' || j.name === '..' || j.name.includes(':'),
+    )
     if (unsafe.length > 0) {
-      window.alert(`Refusing unsafe name(s): ${unsafe.join(', ')}`)
-      names = names.filter((n) => !unsafe.includes(n))
-      if (names.length === 0) return
+      window.alert(`Refusing unsafe name(s): ${unsafe.map((j) => j.name).join(', ')}`)
+      jobs = jobs.filter((j) => !unsafe.includes(j))
+      if (jobs.length === 0) return
     }
-    const jobs = names.map((name) => ({
-      name,
-      local: joinPath('local', localPath, name),
-      remote: joinPath('remote', remotePath, name),
-    }))
 
     // Overwrite guard: check whether each name already exists at the
     // destination and confirm before clobbering. Silent overwrite on a tool
@@ -290,6 +296,16 @@ export function SftpView({
       kept.push(job)
     }
     if (kept.length > 0) onStartTransfer(session.id, direction, kept)
+  }
+
+  const start = (side: PaneSide, names: string[]) => {
+    const direction = side === 'local' ? 'upload' : 'download'
+    const jobs = names.map((name) => ({
+      name,
+      local: joinPath('local', localPath, name),
+      remote: joinPath('remote', remotePath, name),
+    }))
+    void confirmAndTransfer(direction, jobs)
   }
 
   return (

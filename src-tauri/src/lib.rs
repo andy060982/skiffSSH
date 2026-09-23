@@ -649,9 +649,13 @@ pub fn run() {
             // indefinitely: 30 days, and at most 500 files. Runs off-thread so a
             // large logs directory never delays the window appearing.
             std::thread::spawn(|| {
-                let n = utils::session_log::prune(30, 500);
-                if n > 0 {
-                    eprintln!("skiff: pruned {n} old session log(s)");
+                // catch_unwind so a panic in pruning (e.g. the logs directory
+                // vanishing mid-scan) is reported rather than silently swallowed
+                // by a dead background thread.
+                match std::panic::catch_unwind(|| utils::session_log::prune(30, 500)) {
+                    Ok(n) if n > 0 => eprintln!("skiff: pruned {n} old session log(s)"),
+                    Ok(_) => {}
+                    Err(_) => eprintln!("skiff: session-log pruning thread panicked"),
                 }
             });
             Ok(())
