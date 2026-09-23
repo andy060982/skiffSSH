@@ -45,6 +45,17 @@ SSH agent is the Windows OpenSSH pipe / Pageant, or `$SSH_AUTH_SOCK` on Linux.
 
 ## Planned (rough priority order)
 
+0. **Nested split layouts** — a pane full-height beside two stacked, arbitrary
+   trees. Needs a recursive layout tree (per-node direction + sizes) replacing
+   the current single-orientation flat model. Next release.
+
+0. **Host-color policies (settings)** — decouple a colour's *appearance* from its
+   *behaviour*. Today "red disables AI" is hardcoded; instead a per-colour policy
+   object (configured in app settings) decides: AI on/off/ask, confirm-on-connect,
+   confirm-each-command, exclude-from-broadcast, paste confirmation, auto-snapshot,
+   forced logging, tab badge. Per-host `aiAllowed` still overrides. Introduces
+   app-level settings storage + a settings UI (neither exists yet).
+
 1. **Scheduled capture** — "connect nightly, snapshot config, disconnect":
    poor-man's RANCID. Composes from existing parts (connect, exec capture,
    snapshots); needs a scheduler and unattended-auth policy decisions.
