@@ -6,6 +6,8 @@ import {
 import type { Host, Session } from '../types'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { getTerm } from '../lib/termRegistry'
+import { scanForSecrets, type SecretHit } from '../lib/secretScan'
+import { ShieldAlert } from 'lucide-react'
 
 interface AiConfig {
   kind: 'anthropic' | 'openai' | 'claude-code'
@@ -70,6 +72,9 @@ export function AiPanel({
   const [messages, setMessages] = useState<Msg[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
+  /** Held request awaiting the user's OK after a secret was detected in what
+   *  would be sent. Null = nothing pending. */
+  const [pendingSend, setPendingSend] = useState<{ thread: Msg[]; systemContext: string; hits: SecretHit[] } | null>(null)
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
 
@@ -107,30 +112,12 @@ export function AiPanel({
     setShowSettings(false)
   }
 
-  const send = useCallback(
-    async (text: string) => {
-      if (!cfg || !session || !host || streaming || !text.trim()) return
-      const userMsg: Msg = { role: 'user', content: text.trim() }
-      const thread = [...messages, userMsg]
+  /** Actually fire the request — reached either directly, or after the user
+   *  clears the secret-warning gate below. */
+  const dispatch = useCallback(
+    async (thread: Msg[], systemContext: string) => {
       setMessages([...thread, { role: 'assistant', content: '' }])
-      setInput('')
       setStreaming(true)
-
-      // Context: the transcript tail for THIS host. Labelled in the thread
-      // header below so the user always knows what was shared.
-      const tail =
-        (await safeInvoke<string | null>('session_history', {
-          host: host.hostname,
-          maxBytes: 4000,
-        })) ?? ''
-
-      const systemContext =
-        `Host: ${host.name} (${host.hostname}:${host.port}, user ${host.username}).\n` +
-        (host.startupCommands?.length
-          ? `On-connect commands (platform hint): ${host.startupCommands.join(' ; ')}\n`
-          : '') +
-        (tail ? `Recent terminal output (untrusted):\n${tail}` : '(no terminal output captured yet)')
-
       const runId = `ai-${Date.now()}`
       unlistenRef.current = await safeListen<AiEvent>(`ai://${runId}`, (ev) => {
         if (ev.error) {
@@ -175,7 +162,43 @@ export function AiPanel({
         ])
       }
     },
-    [cfg, session, host, streaming, messages],
+    [cfg],
+  )
+
+  const send = useCallback(
+    async (text: string) => {
+      if (!cfg || !session || !host || streaming || !text.trim()) return
+      const userMsg: Msg = { role: 'user', content: text.trim() }
+      const thread = [...messages, userMsg]
+      setInput('')
+
+      // Context: the transcript tail for THIS host. Labelled in the thread
+      // header below so the user always knows what was shared.
+      const tail =
+        (await safeInvoke<string | null>('session_history', {
+          host: host.hostname,
+          maxBytes: 4000,
+        })) ?? ''
+
+      const systemContext =
+        `Host: ${host.name} (${host.hostname}:${host.port}, user ${host.username}).\n` +
+        (host.startupCommands?.length
+          ? `On-connect commands (platform hint): ${host.startupCommands.join(' ; ')}\n`
+          : '') +
+        (tail ? `Recent terminal output (untrusted):\n${tail}` : '(no terminal output captured yet)')
+
+      // Pre-send secret guard: if the context that is about to leave the
+      // machine looks like it holds a credential, pause and make the user
+      // confirm. Their own typed question is scanned too — a pasted password
+      // in the prompt should trip it as readily as one in an on-connect line.
+      const hits = scanForSecrets(systemContext + '\n' + text)
+      if (hits.length > 0) {
+        setPendingSend({ thread, systemContext, hits })
+        return
+      }
+      void dispatch(thread, systemContext)
+    },
+    [cfg, session, host, streaming, messages, dispatch],
   )
 
   const explainSelection = () => {
@@ -288,6 +311,67 @@ export function AiPanel({
             </div>
           </div>
         </>
+      )}
+      {pendingSend && (
+        <div className="absolute inset-0 z-[70] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-surface-0/80"
+            onMouseDown={() => setPendingSend(null)}
+            aria-hidden
+          />
+          <div className="relative w-full max-w-[20rem] overflow-hidden rounded-panel border border-warn/50 bg-surface-2 shadow-2xl">
+            <header className="flex items-center gap-2 border-b border-line px-3 py-2.5">
+              <ShieldAlert size={15} className="shrink-0 text-warn" aria-hidden />
+              <span className="text-[12.5px] font-medium text-ink">Possible secret in context</span>
+            </header>
+            <div className="space-y-2 px-3 py-3 text-[12px] text-ink-dim">
+              <p>
+                What would be sent to the AI provider looks like it contains a
+                credential. Nothing has left this machine yet.
+              </p>
+              <ul className="space-y-1 rounded border border-line bg-surface-0 p-2">
+                {pendingSend.hits.slice(0, 6).map((h, i) => (
+                  <li key={i} className="min-w-0">
+                    <span className="block text-[11px] text-warn">{h.reason}</span>
+                    <code className="selectable block truncate font-mono text-[10.5px] text-ink-faint">
+                      {h.preview}
+                    </code>
+                  </li>
+                ))}
+                {pendingSend.hits.length > 6 && (
+                  <li className="text-[10.5px] text-ink-faint">
+                    +{pendingSend.hits.length - 6} more
+                  </li>
+                )}
+              </ul>
+              <p className="text-[11px] text-ink-faint">
+                Secrets belong in the credential vault, not in on-connect
+                commands or snippets. Send anyway only if these are safe to
+                share with the provider.
+              </p>
+            </div>
+            <footer className="flex justify-end gap-2 border-t border-line bg-surface-1 px-3 py-2.5">
+              <button
+                type="button"
+                onClick={() => setPendingSend(null)}
+                className="rounded border border-line px-3 py-1 text-[12px] text-ink-dim hover:bg-surface-3 hover:text-ink"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const p = pendingSend
+                  setPendingSend(null)
+                  void dispatch(p.thread, p.systemContext)
+                }}
+                className="rounded border border-warn/60 bg-warn/15 px-3 py-1 text-[12px] font-medium text-warn hover:bg-warn/25"
+              >
+                Send anyway
+              </button>
+            </footer>
+          </div>
+        </div>
       )}
     </aside>
   )
