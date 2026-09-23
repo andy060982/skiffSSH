@@ -527,7 +527,7 @@ async fn ssh_copy_id(
 
 #[tauri::command]
 async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
-    use russh::keys::ssh_key::{self, rand_core::OsRng, LineEnding};
+    use russh::keys::ssh_key::{self, getrandom::SysRng, rand_core::UnwrapErr, LineEnding};
 
     let home = std::env::var_os("USERPROFILE").ok_or("no USERPROFILE")?;
     let dir = std::path::PathBuf::from(home).join(".ssh");
@@ -542,9 +542,12 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
         n += 1;
     }
 
-    let mut key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
+    // ssh-key's RNG is fallible (SysRng: TryCryptoRng); UnwrapErr adapts it to
+    // the infallible CryptoRng that PrivateKey::random requires.
+    let mut rng = UnwrapErr(SysRng);
+    let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
         .map_err(|e| e.to_string())?;
-    key.set_comment(&comment);
+    key.set_comment(comment);
 
     key.write_openssh_file(&path, LineEnding::LF)
         .map_err(|e| e.to_string())?;

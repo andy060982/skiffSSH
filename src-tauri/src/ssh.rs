@@ -214,8 +214,18 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::ssh_key::PublicKey,
+        presented: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        // russh 0.63 hands us a key-or-certificate. Skiff pins the plain public
+        // key; for a certificate we pin the embedded key. Either way the trust
+        // decision below runs against a concrete PublicKey.
+        let server_public_key = match presented {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
+            russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
+                russh::keys::ssh_key::PublicKey::new(cert.public_key().clone(), "")
+            }
+        };
+        let server_public_key = &server_public_key;
         // Tri-state, and the mapping is the whole security property:
         //   Trusted -> accept silently
         //   Changed -> refuse, never prompt
@@ -1275,12 +1285,12 @@ async fn agent_auth(
             }
         }
 
-        // Pageant (PuTTY). connect_pageant never fails to construct; a missing
-        // Pageant surfaces when the identity request errors, which lands us in
-        // the Ok(None) fall-through below.
-        let mut pageant = AgentClient::connect_pageant().await;
-        if let Some(r) = try_agent_identities(&mut pageant, handle, username, hash_alg, "pageant").await? {
-            return Ok(Some(r));
+        // Pageant (PuTTY). russh 0.63 makes connect_pageant fallible; a missing
+        // Pageant is just "no agent", so skip on Err and fall through.
+        if let Ok(mut pageant) = AgentClient::connect_pageant().await {
+            if let Some(r) = try_agent_identities(&mut pageant, handle, username, hash_alg, "pageant").await? {
+                return Ok(Some(r));
+            }
         }
     }
 
@@ -1314,7 +1324,10 @@ async fn try_agent_identities(
     let Ok(identities) = agent.request_identities().await else {
         return Ok(None);
     };
-    for key in identities {
+    for identity in identities {
+        // russh 0.63 yields AgentIdentity (key or certificate); publickey auth
+        // wants the underlying PublicKey.
+        let key = identity.public_key().into_owned();
         let result = handle
             .authenticate_publickey_with(username, key, hash_alg, agent)
             .await
