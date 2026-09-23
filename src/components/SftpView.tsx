@@ -247,6 +247,17 @@ export function SftpView({
 
   const start = async (side: PaneSide, names: string[]) => {
     const direction = side === 'local' ? 'upload' : 'download'
+    // Downloads turn a server-chosen name into a LOCAL path. Reject any name
+    // that is not a plain component so a malicious server cannot write outside
+    // the target folder (the backend enforces this too; this is the friendly
+    // front-line message). Uploads are safe — the remote side is the server's
+    // own filesystem — but guarding both keeps the rule simple.
+    const unsafe = names.filter((n) => /[\/]/.test(n) || n === '..' || n.includes(':'))
+    if (unsafe.length > 0) {
+      window.alert(`Refusing unsafe name(s): ${unsafe.join(', ')}`)
+      names = names.filter((n) => !unsafe.includes(n))
+      if (names.length === 0) return
+    }
     const jobs = names.map((name) => ({
       name,
       local: joinPath('local', localPath, name),

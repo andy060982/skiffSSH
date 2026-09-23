@@ -721,6 +721,17 @@ impl Registry {
             .map(|m| m.file_type().is_dir())
             .unwrap_or(false);
 
+        // Single file: the frontend built `local` from the server's name, so
+        // verify its final component has not been used to escape the target.
+        let last = std::path::Path::new(local)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !safe_local_component(&last) {
+            return Err(SshError::PartialTransfer(format!(
+                "refusing to write unsafe filename: {last}"
+            )));
+        }
         if !is_dir {
             return copy_remote_file(&sftp, app, session_id, remote, local).await;
         }
@@ -732,6 +743,12 @@ impl Registry {
             tokio::fs::create_dir_all(&ldir).await?;
             for entry in sftp.read_dir(&rdir).await? {
                 let name = entry.file_name();
+                // The server chose this name; refuse anything that is not a
+                // plain component before it becomes a local path.
+                if !safe_local_component(&name) {
+                    failed.push(format!("{name} (unsafe name, skipped)"));
+                    continue;
+                }
                 let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
                 let lpath = std::path::Path::new(&ldir)
                     .join(&name)
@@ -1260,6 +1277,24 @@ async fn agent_auth(
     Ok(None)
 }
 
+/// Reject a remote-supplied name that could escape the local target directory.
+///
+/// A malicious or compromised server controls the filenames it lists, and on
+/// download those names become LOCAL path components. A name like
+/// `..\Windows\evil` — or an absolute path, which `Path::join` uses to
+/// REPLACE the base entirely — would write outside the folder the user chose.
+/// This is the scp/zip-slip class; the defense is to accept only plain file
+/// names as path components.
+fn safe_local_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(':') // drive letters / ADS on Windows
+        && !name.contains('\0')
+}
+
 /// Copy one remote file to a local path, streaming with progress.
 async fn copy_remote_file(
     sftp: &SftpSession,
@@ -1468,4 +1503,22 @@ fn mode_string(permissions: Option<u32>, kind: &str) -> String {
         )
     };
     format!("{lead}{}{}{}", rwx(6), rwx(3), rwx(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_local_component;
+
+    #[test]
+    fn rejects_traversal_and_absolute_names() {
+        assert!(safe_local_component("report.txt"));
+        assert!(safe_local_component("id_ed25519.pub"));
+        assert!(!safe_local_component(".."));
+        assert!(!safe_local_component("."));
+        assert!(!safe_local_component(""));
+        assert!(!safe_local_component("../etc/passwd"));
+        assert!(!safe_local_component("..\\Windows\\evil"));
+        assert!(!safe_local_component("sub/dir"));
+        assert!(!safe_local_component("C:evil")); // drive-relative
+    }
 }
