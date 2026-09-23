@@ -75,19 +75,31 @@ export function expandTokens(command: string, paneIndex: number): string {
   return command.split('{pane}').join(String(paneIndex))
 }
 
-/** Reads either the current array field or the earlier single-string field.
+/** The stored commands as-is, WITHOUT token expansion.
  *
- *  Hosts saved before this change carry `startupCommand`; rather than migrating
+ *  Reads either the current array field or the earlier single-string field.
+ *  Hosts saved before that change carry `startupCommand`; rather than migrating
  *  hosts.json on load (which risks rewriting a file over a half-read parse),
- *  both shapes are accepted here and the array wins. */
-export function resolveStartupCommands(
-  host: { startupCommands?: string[]; startupCommand?: string },
-  paneIndex = 1,
-): string[] {
-  const list = host.startupCommands?.length
+ *  both shapes are accepted here and the array wins.
+ *
+ *  Use this anywhere the literal command matters — editing (so `{pane}` is not
+ *  frozen to a number on save) and preset matching (whose commands contain the
+ *  literal `{pane}`). Use `resolveStartupCommands` only at connect time. */
+export function rawStartupCommands(host: {
+  startupCommands?: string[]
+  startupCommand?: string
+}): string[] {
+  return host.startupCommands?.length
     ? host.startupCommands
     : host.startupCommand?.trim()
       ? [host.startupCommand.trim()]
       : []
-  return list.map((c) => expandTokens(c, paneIndex))
+}
+
+/** The stored commands with per-session tokens expanded — for connect time. */
+export function resolveStartupCommands(
+  host: { startupCommands?: string[]; startupCommand?: string },
+  paneIndex = 1,
+): string[] {
+  return rawStartupCommands(host).map((c) => expandTokens(c, paneIndex))
 }

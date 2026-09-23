@@ -5,7 +5,7 @@ import { allHosts } from '../lib/tree'
 import {
   STARTUP_PRESETS,
   customCommands,
-  resolveStartupCommands,
+  rawStartupCommands,
 } from '../lib/startupPresets'
 import { HOST_COLORS } from '../lib/hostColors'
 import { safeInvoke } from '../lib/tauri'
@@ -49,11 +49,11 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
   const [password, setPassword] = useState('')
   /** Live list of on-connect commands: selected presets plus custom lines. */
   const [startup, setStartup] = useState<string[]>(() =>
-    resolveStartupCommands(host ?? {}),
+    rawStartupCommands(host ?? {}),
   )
   const [snippets, setSnippets] = useState<Snippet[]>(() => host?.snippets ?? [])
   const [showAdvanced, setShowAdvanced] = useState(
-    () => customCommands(resolveStartupCommands(host ?? {})).length > 0,
+    () => customCommands(rawStartupCommands(host ?? {})).length > 0,
   )
   const [hasSaved, setHasSaved] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -106,7 +106,9 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
       // can never disagree about what runs.
       onSave({
         ...draft,
-        startupCommands: startup,
+        // Clean once, here: drop blank lines and surrounding whitespace the
+        // free-typing textarea allowed while editing.
+        startupCommands: startup.map((c) => c.trim()).filter(Boolean),
         startupCommand: undefined,
         snippets: snippets.filter((sn) => sn.command.trim() !== ''),
       })
@@ -486,10 +488,11 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 rows={3}
                 value={customCommands(startup).join('\n')}
                 onChange={(e) => {
-                  const custom = e.target.value
-                    .split('\n')
-                    .map((l) => l.trim())
-                    .filter(Boolean)
+                  // Keep lines verbatim — no trim/filter here. Trimming on each
+                  // keystroke would strip a trailing space or a new line the
+                  // instant it is typed, making spaces between words and new
+                  // lines impossible to enter. Cleaning happens once, on save.
+                  const custom = e.target.value.split('\n')
                   // Presets keep their order; custom lines follow.
                   const presets = startup.filter((c) =>
                     STARTUP_PRESETS.some((p) => p.command === c),
