@@ -1,0 +1,70 @@
+name: Release
+
+# Push a version tag (e.g. v0.2.0) and this builds Skiff on Windows and Linux
+# and attaches every installer/bundle to a GitHub release for that tag.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            patchelf
+
+      - run: npm ci
+
+      - name: Build release bundles
+        # APPIMAGE_EXTRACT_AND_RUN lets appimagetool run without FUSE on the
+        # GitHub runner. On Windows the flag is simply ignored.
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: npm run tauri build
+
+      - name: Upload artifacts to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Skiff ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/skiff.exe
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage

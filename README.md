@@ -146,16 +146,25 @@ and how to report a vulnerability.
 
 ## Install
 
-Two artifacts on the [Releases](../../releases) page:
+Grab the artifacts for your platform from the [Releases](../../releases) page.
 
-- **`Skiff_x64-setup.exe`** — installer. Per-user, no admin prompt, Start Menu
-  entry and uninstaller, and it auto-installs the WebView2 runtime if the
-  machine lacks it. Recommended.
+**Windows**
+- **`Skiff_<version>_x64-setup.exe`** — installer. Per-user, no admin prompt,
+  Start Menu entry and uninstaller, and it auto-installs the WebView2 runtime if
+  the machine lacks it. Recommended.
 - **`skiff.exe`** — portable single file. Run from anywhere, delete to remove.
   Assumes WebView2 is present (it ships with Windows 10/11).
 
-> Skiff is not code-signed yet, so SmartScreen may warn on first run — choose
-> **More info → Run anyway**. (Signing is on the roadmap.)
+**Linux**
+- **`.AppImage`** — universal, no install: `chmod +x Skiff_*.AppImage && ./Skiff_*.AppImage`
+  on any recent distro.
+- **`.deb`** — Debian/Ubuntu: `sudo apt install ./skiff_<version>_amd64.deb`.
+
+  Secrets are stored in the freedesktop Secret Service (GNOME Keyring / KWallet),
+  and the SSH agent is read from `$SSH_AUTH_SOCK`.
+
+> Windows builds are not code-signed yet, so SmartScreen may warn on first run —
+> choose **More info → Run anyway**. (Signing is on the roadmap.)
 
 ## Build from source
 
@@ -199,9 +208,9 @@ npm run tauri dev                    # hot reload + devtools
 Planned work and the reasoning behind deliberately *rejected* features are in
 [ROADMAP.md](ROADMAP.md). Current limitations:
 
-- **Windows only** for now — the credential store and agent integration are
-  Win32. macOS is the first planned port (the SSH engine and UI are already
-  cross-platform).
+- **macOS** is not built yet — the code is cross-platform (Keychain and
+  `$SSH_AUTH_SOCK` agent support are in place), it just needs a signed and
+  notarised build. **Windows and Linux ship today.**
 - **Remote forwarding (`-R`)** is not implemented yet; `-L` and `-D` are.
 - **Transcripts are lossy for full-screen programs** (vim, top) — inherent to
   flattening a live terminal into a text log.

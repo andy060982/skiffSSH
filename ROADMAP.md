@@ -5,6 +5,10 @@ work (and future contributors) inherit the reasoning, not just the code.
 
 ## Shipped
 
+**Platforms:** Windows and Linux (v0.2.0). Secrets live in the OS vault on each —
+Windows Credential Manager, or the freedesktop Secret Service on Linux — and the
+SSH agent is the Windows OpenSSH pipe / Pageant, or `$SSH_AUTH_SOCK` on Linux.
+
 ### Core
 - Terminal: xterm.js + WebGL, persistent scrollback across tab switches,
   split panes (columns/rows, resizable, per-pane tmux `skiff-{pane}`),
@@ -69,8 +73,10 @@ work (and future contributors) inherit the reasoning, not just the code.
     current need.
 11. **Trace-path visualisation** — run traceroute from inside a session and
     render hops; nice, not core.
-12. **macOS/Linux ports** — needs a credential-store and agent abstraction
-    (libsecret/keychain, SSH_AUTH_SOCK); everything else is portable already.
+12. **macOS port** — the credential-store/agent abstraction now exists
+    (Windows Credential Manager / Linux Secret Service / `$SSH_AUTH_SOCK`), so
+    macOS only needs a signed + notarised build produced on a mac runner.
+    **Linux shipped in v0.2.0.**
 
 ## Deliberately rejected
 
