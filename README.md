@@ -18,9 +18,13 @@ you don't.
 
 ## Screenshots
 
-![Host catalogue with folders, per-host accent colors, and PROD tags](docs/screenshots/01-hosts.png)
+![Live terminal session](docs/screenshots/02-terminal.png)
 
-_More screenshots (terminal, SFTP, AI assistant) coming soon._
+| | |
+|---|---|
+| ![Host catalogue with folders, accent colors, and PROD tags](docs/screenshots/01-hosts.png) | ![Dual-pane SFTP transfer](docs/screenshots/03-sftp.png) |
+
+![AI assistant suggesting read-only commands as insertable chips](docs/screenshots/04-ai.png)
 
 ---
 
