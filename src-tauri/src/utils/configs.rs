@@ -18,9 +18,18 @@ use super::known_hosts::KnownHostsError;
 /// Reuse the transcript slug + timestamp conventions so all per-host artifacts
 /// look alike on disk.
 fn slug(s: &str) -> String {
-    s.chars()
+    let out: String = s
+        .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
-        .collect()
+        .collect();
+    // Keeping '.' allows normal hostnames, but a slug that is all dots ("."/"..")
+    // would be a path-traversal component. Neutralise those so `configs_dir`
+    // can never escape the configs root.
+    if out.chars().all(|c| c == '.') {
+        "_".repeat(out.len().max(1))
+    } else {
+        out
+    }
 }
 
 fn configs_dir(host: &str) -> Result<PathBuf, KnownHostsError> {

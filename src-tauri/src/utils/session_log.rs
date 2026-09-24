@@ -446,7 +446,15 @@ pub fn read_log(name: &str) -> Result<String, KnownHostsError> {
 /// Inverse of `timestamp_name`: "YYYYMMDD-HHMMSS" back to epoch seconds.
 fn parse_stamp(s: &str) -> Option<u64> {
     let (date, time) = s.split_once('-')?;
-    if date.len() != 8 || time.len() != 6 {
+    // Require exactly 8 + 6 ASCII digits. Without the digit check, a multibyte
+    // char that satisfies the byte-length test (e.g. "123é456") would panic at
+    // the byte-offset slices below — and with panic=abort that kills the whole
+    // app when logs_list scans a crafted filename.
+    if date.len() != 8
+        || time.len() != 6
+        || !date.bytes().all(|b| b.is_ascii_digit())
+        || !time.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     let y: i64 = date[0..4].parse().ok()?;

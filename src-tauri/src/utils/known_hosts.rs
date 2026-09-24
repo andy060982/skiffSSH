@@ -136,13 +136,58 @@ pub fn check(host: &str, port: u16, key: &PublicKey) -> Result<HostKeyStatus, Kn
 fn classify(host: &str, port: u16, key: &PublicKey, path: &Path) -> HostKeyStatus {
     match check_known_hosts_path(host, port, key, path) {
         Ok(true) => HostKeyStatus::Trusted,
-        // No entry matched. Not an error, and emphatically not a mismatch.
-        Ok(false) => HostKeyStatus::Unknown,
+        Ok(false) => {
+            // russh found no key on file matching the presented one. That is
+            // NOT automatically "unknown host": russh only reports KeyChanged
+            // for a *same-algorithm* mismatch, so a host we already trust that
+            // presents a different-algorithm key (a classic downgrade/
+            // interception move) also lands here. Distinguish:
+            //   - host has no entry at all   -> genuinely first use -> prompt
+            //   - host IS on file, key isn't -> treat as Changed -> refuse,
+            //     never a silent trust prompt. Recovery is explicit: remove the
+            //     host's known_hosts line, then reconnect to re-trust.
+            match host_entry_line(host, port, path) {
+                Some(line) => HostKeyStatus::Changed { line },
+                None => HostKeyStatus::Unknown,
+            }
+        }
         Err(russh::keys::Error::KeyChanged { line }) => HostKeyStatus::Changed { line },
         // Anything else (missing file, unreadable line) is treated as "we have
         // no opinion", which routes to the prompt rather than silent acceptance.
         Err(_) => HostKeyStatus::Unknown,
     }
+}
+
+/// The 1-based line number of the first known_hosts entry naming this host
+/// (plaintext host fields only — hashed `|1|…` entries can't be matched by
+/// name, but Skiff writes plaintext). `None` if the host is absent entirely.
+fn host_entry_line(host: &str, port: u16, path: &Path) -> Option<usize> {
+    let needle = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let mut first = fields.next()?;
+        // Skip an @revoked / @cert-authority marker to reach the host field.
+        if first.starts_with('@') {
+            first = match fields.next() {
+                Some(f) => f,
+                None => continue,
+            };
+        }
+        // Host field may be a comma-separated list of patterns.
+        if first.split(',').any(|h| h.eq_ignore_ascii_case(&needle)) {
+            return Some(i + 1);
+        }
+    }
+    None
 }
 
 /// Append a host's public key to the store, creating the directory and file if

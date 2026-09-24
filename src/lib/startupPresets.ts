@@ -36,6 +36,17 @@ export const STARTUP_PRESETS: StartupPreset[] = [
     hint: 'Same idea where tmux is unavailable.',
   },
   {
+    // `start-server \; set -g mouse on` (not a bare `set -g mouse on`) so it works
+    // regardless of send order: if it runs before the tmux session exists it
+    // starts the server and sets the global option, which the new session then
+    // inherits; if it runs after (inside tmux) it applies immediately. `set -g`
+    // is a SERVER-WIDE tmux option — hence the warning in the hint.
+    id: 'tmux-mouse',
+    label: 'Mouse-wheel scroll in tmux',
+    command: 'tmux start-server \\; set -g mouse on',
+    hint: 'Wheel scrolls the tmux buffer, not shell history. Turns on tmux mouse mode SERVER-WIDE (affects all your tmux sessions). Hold Shift to select text normally.',
+  },
+  {
     id: 'panos-width',
     label: 'Wide terminal (PAN-OS)',
     command: 'set cli terminal width 200',

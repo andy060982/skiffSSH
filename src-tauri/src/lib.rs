@@ -108,7 +108,7 @@ async fn ssh_resize(
 
 #[tauri::command]
 async fn ssh_disconnect(registry: State<'_, Registry>, session_id: String) -> CmdResult<()> {
-    registry.remove(&session_id);
+    registry.remove(&session_id).await;
     Ok(())
 }
 
@@ -529,17 +529,33 @@ async fn ssh_copy_id(
 async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     use russh::keys::ssh_key::{self, getrandom::SysRng, rand_core::UnwrapErr, LineEnding};
 
+    // Cross-platform home via the shared helper (USERPROFILE on Windows, HOME
+    // on macOS/Linux) — keeps the Windows-only assumption out of keygen.
     let home = utils::platform::home_dir().ok_or("could not determine home directory")?;
     let dir = home.join(".ssh");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     // Never clobber an existing key: a keypair someone already deployed to
-    // twenty servers is irreplaceable. Pick the first free suffixed name.
+    // twenty servers is irreplaceable. Reserve the name ATOMICALLY with an
+    // exclusive create (O_EXCL) and bump the suffix on collision — a plain
+    // exists()-then-write races two concurrent keygens onto the same path.
     let mut path = dir.join("skiff_ed25519");
     let mut n = 1;
-    while path.exists() {
-        path = dir.join(format!("skiff_ed25519_{n}"));
-        n += 1;
+    let mut file = loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => break f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                path = dir.join(format!("skiff_ed25519_{n}"));
+                n += 1;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    // Private key file is 0600 on Unix (OpenSSH refuses group/world-readable keys).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 
     // ssh-key's RNG is fallible (SysRng: TryCryptoRng); UnwrapErr adapts it to
@@ -549,8 +565,13 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
         .map_err(|e| e.to_string())?;
     key.set_comment(comment);
 
-    key.write_openssh_file(&path, LineEnding::LF)
-        .map_err(|e| e.to_string())?;
+    // Write into the handle we already hold, not a fresh path open — keeps the
+    // exclusive reservation intact.
+    {
+        use std::io::Write;
+        let pem = key.to_openssh(LineEnding::LF).map_err(|e| e.to_string())?;
+        file.write_all(pem.as_bytes()).map_err(|e| e.to_string())?;
+    }
 
     let public = key
         .public_key()

@@ -1,8 +1,13 @@
 //! SSH transport, PTY I/O, and SFTP, built on russh (pure Rust — no libssh2 or
 //! OpenSSL system dependency, so the Windows build needs no vcpkg).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Process-wide monotonic counter for unique host-key approval ids. `Instant`
+/// elapsed-since-now is ~0 and collides across concurrent connections; a
+/// counter never repeats within a run.
+static HOSTKEY_SEQ: AtomicU64 = AtomicU64::new(0);
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -242,7 +247,11 @@ impl client::Handler for ClientHandler {
             Err(e) => return Err(SshError::KnownHosts(e)),
         }
 
-        let request_id = format!("hk-{}-{}", self.host, Instant::now().elapsed().as_nanos());
+        let request_id = format!(
+            "hk-{}-{}",
+            self.host,
+            HOSTKEY_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let fingerprint = server_public_key
             .fingerprint(russh::keys::HashAlg::Sha256)
             .to_string();
@@ -313,6 +322,10 @@ pub struct Session {
 #[derive(Default)]
 pub struct Registry {
     sessions: DashMap<String, Arc<Session>>,
+    /// Output-pump task per session, so disconnect can stop it — otherwise the
+    /// pump keeps an Arc<Session> (hence the SSH Handle) alive and blocks on
+    /// `read_half.wait()` forever after the tab is "closed".
+    pumps: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Active local forwards: id -> (info, listener task). Aborting the task
     /// closes the listener; established tunnels drain on their own.
     forwards: DashMap<String, (ForwardInfo, tokio::task::JoinHandle<()>)>,
@@ -326,8 +339,30 @@ impl Registry {
             .ok_or_else(|| SshError::NoSession(id.to_string()))
     }
 
-    pub fn remove(&self, id: &str) {
-        self.sessions.remove(id);
+    /// Tear a session down for real: stop the pump, send an SSH disconnect so
+    /// the transport actually closes (Handle's Drop does NOT close it), and
+    /// sweep the session's forwards. Without the explicit disconnect the
+    /// authenticated connection and remote shell keep running after the user
+    /// thinks they have closed the tab.
+    pub async fn remove(&self, id: &str) {
+        let session = self.sessions.remove(id).map(|(_, s)| s);
+
+        // Stop the output pump first so it drops its Arc<Session> and stops
+        // emitting; then the only remaining Handle reference is ours below.
+        if let Some((_, pump)) = self.pumps.remove(id) {
+            pump.abort();
+        }
+
+        if let Some(session) = session {
+            session.alive.store(false, Ordering::Relaxed);
+            // Send SSH_MSG_DISCONNECT. Best-effort: if the link is already gone
+            // this errors harmlessly. This is what frees the transport.
+            let _ = session
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "closed by user", "")
+                .await;
+        }
+
         // A forward's transport is this session; with it gone the listener
         // would sit accepting connections it can never tunnel, forever. Sweep
         // them here so closing a tab tears down its tunnels too.
@@ -499,7 +534,7 @@ impl Registry {
         let pump_session = Arc::clone(&session);
         let sid = session_id.to_string();
 
-        tokio::spawn(async move {
+        let pump = tokio::spawn(async move {
             // Distinguishes a clean logout from a link that died under us. The
             // difference matters to the user: one is expected, the other means
             // "your VPN dropped" or "the firewall timed you out".
@@ -559,6 +594,7 @@ impl Registry {
                 },
             );
         });
+        self.pumps.insert(session_id.to_string(), pump);
 
         Ok(())
     }
@@ -1022,6 +1058,8 @@ impl Registry {
         channel.exec(true, command).await?;
 
         let mut out: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        let mut exit_status: Option<u32> = None;
         let collect = async {
             while let Some(msg) = channel.wait().await {
                 match msg {
@@ -1032,16 +1070,43 @@ impl Registry {
                         // (someone snapshots `tail -f`) must not eat RAM
                         // until the timeout.
                         if out.len() > 16 * 1024 * 1024 {
+                            truncated = true;
                             break;
                         }
                     }
+                    ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
                     ChannelMsg::Eof | ChannelMsg::Close => break,
                     _ => {}
                 }
             }
         };
         // The timeout is the guard against commands that never EOF.
-        let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), collect).await;
+        let completed = tokio::time::timeout(Duration::from_secs(timeout_secs), collect)
+            .await
+            .is_ok();
+
+        // Don't pass off a partial or failed capture as a valid snapshot:
+        //  - timed out  -> we have no idea if the config finished printing
+        //  - truncated  -> hit the size cap mid-dump
+        //  - exit != 0  -> the command itself reported failure (missing status
+        //    is tolerated: much network gear never sends one over exec)
+        if !completed {
+            return Err(SshError::PartialTransfer(format!(
+                "capture timed out after {timeout_secs}s; output discarded"
+            )));
+        }
+        if truncated {
+            return Err(SshError::PartialTransfer(
+                "capture exceeded 16 MiB; output discarded".into(),
+            ));
+        }
+        if let Some(code) = exit_status {
+            if code != 0 {
+                return Err(SshError::PartialTransfer(format!(
+                    "capture command exited with status {code}"
+                )));
+            }
+        }
 
         let (clean, _) = crate::utils::session_log::strip_ansi(&out);
         Ok(String::from_utf8_lossy(&clean).to_string())
@@ -1228,9 +1293,15 @@ pub async fn copy_id(
     authenticate(&mut handle, "", username, "password", None, Some(password)).await?;
 
     // grep -qxF: only append if the exact line is not already present, so
-    // running this twice does not duplicate the key.
+    // running this twice does not duplicate the key. The append is BRACE-GROUPED
+    // so the whole chain is conjunctive: SKIFF_KEY_OK is printed only if every
+    // step — including the append — actually succeeded. (The earlier version
+    // used `;` before chmod/echo, which printed the success marker even when the
+    // append failed, e.g. a full or read-only home directory.)
     let cmd = format!(
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys &&          grep -qxF '{key}' ~/.ssh/authorized_keys || printf '%s\n' '{key}' >> ~/.ssh/authorized_keys;          chmod 600 ~/.ssh/authorized_keys && echo SKIFF_KEY_OK"
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys \
+         && {{ grep -qxF '{key}' ~/.ssh/authorized_keys || printf '%s\n' '{key}' >> ~/.ssh/authorized_keys; }} \
+         && chmod 600 ~/.ssh/authorized_keys && echo SKIFF_KEY_OK"
     );
 
     let mut channel = handle.channel_open_session().await?;
@@ -1379,25 +1450,72 @@ async fn copy_remote_file(
     remote: &str,
     local: &str,
 ) -> Result<u64, SshError> {
+    // Never write THROUGH an existing symlink at the destination: a
+    // server-controlled tree must not use a pre-placed link to redirect a
+    // download outside the folder the user chose.
+    if let Ok(meta) = tokio::fs::symlink_metadata(local).await {
+        if meta.file_type().is_symlink() {
+            return Err(SshError::PartialTransfer(format!(
+                "refusing to overwrite a symlink: {local}"
+            )));
+        }
+    }
+
     let total = sftp.metadata(remote).await.ok().and_then(|m| m.size).unwrap_or(0);
     let mut src = sftp.open(remote).await?;
-    let mut dst = tokio::fs::File::create(local).await?;
 
-    let mut reporter = Reporter::new(app, session_id, remote, total, "download");
-    let mut buf = vec![0u8; CHUNK];
-    let mut done = 0u64;
-    loop {
-        let n = src.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    // Stream to a unique temp file beside the destination, then atomically
+    // rename over it. A failed/cancelled/interrupted transfer therefore never
+    // destroys the existing file or leaves a truncated partial in its place.
+    let tmp = temp_sibling(local);
+    let copy_result: Result<u64, SshError> = async {
+        let mut dst = tokio::fs::File::create(&tmp).await?;
+        let mut reporter = Reporter::new(app, session_id, remote, total, "download");
+        let mut buf = vec![0u8; CHUNK];
+        let mut done = 0u64;
+        loop {
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n]).await?;
+            done += n as u64;
+            reporter.tick(done);
         }
-        dst.write_all(&buf[..n]).await?;
-        done += n as u64;
-        reporter.tick(done);
+        dst.flush().await?;
+        reporter.finish(done);
+        Ok(done)
     }
-    dst.flush().await?;
-    reporter.finish(done);
-    Ok(done)
+    .await;
+
+    match copy_result {
+        Ok(done) => {
+            // Atomic replace. std::fs::rename replaces an existing file on both
+            // Unix and Windows; if the platform refuses (e.g. dest locked),
+            // fall back to remove-then-rename rather than lose the new content.
+            if tokio::fs::rename(&tmp, local).await.is_err() {
+                let _ = tokio::fs::remove_file(local).await;
+                if let Err(e) = tokio::fs::rename(&tmp, local).await {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err(e.into());
+                }
+            }
+            Ok(done)
+        }
+        Err(e) => {
+            // Leave the original untouched; drop the partial temp.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(e)
+        }
+    }
+}
+
+/// A unique sibling path for atomic writes: `<name>.<n>.skiffpart`. The counter
+/// makes concurrent transfers to the same directory collision-free.
+fn temp_sibling(path: &str) -> String {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{path}.{n}.skiffpart")
 }
 
 /// Copy one local file to a remote path, streaming with progress.

@@ -81,23 +81,31 @@ pub fn save(tree: &Value) -> Result<(), KnownHostsError> {
     let pretty = serde_json::to_string_pretty(tree)
         .map_err(|e| KnownHostsError::Parse(e.to_string()))?;
 
-    let tmp = path.with_extension("json.tmp");
+    // Unique temp name (pid-scoped) so two concurrent saves can't stomp the
+    // same scratch file and interleave each other's bytes.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, pretty).map_err(|source| KnownHostsError::Io {
         path: tmp.clone(),
         source,
     })?;
 
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|source| KnownHostsError::Io {
+    // Try an atomic rename-replace first (works on Unix, and on Windows where
+    // std::fs::rename replaces an existing file). Only if that fails do we fall
+    // back to remove-then-rename — the one window where a crash could lose the
+    // file — and even then the unique temp above is still intact on disk.
+    if std::fs::rename(&tmp, &path).is_err() {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|source| KnownHostsError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|source| KnownHostsError::Io {
             path: path.clone(),
             source,
         })?;
     }
-
-    std::fs::rename(&tmp, &path).map_err(|source| KnownHostsError::Io {
-        path: path.clone(),
-        source,
-    })
+    Ok(())
 }
 
 /* -------------------------------------------------------------------------- */

@@ -46,6 +46,12 @@ fn validate_target(target: &str) -> Result<(), String> {
     if target.is_empty() || target.len() > 253 {
         return Err("invalid target".into());
     }
+    // A leading '-' would be parsed by ping/traceroute as an OPTION, not a
+    // host (argv, so not shell injection — but e.g. a flood/-flag or an output
+    // option is still unwanted). Reject it outright.
+    if target.starts_with('-') {
+        return Err(format!("invalid target (cannot start with '-'): {target}"));
+    }
     if !target
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))

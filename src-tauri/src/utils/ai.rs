@@ -73,6 +73,24 @@ fn vault_profile(profile: &str) -> String {
     format!("ai:{profile}")
 }
 
+/// True if the URL targets loopback, so plain HTTP is acceptable (local Ollama
+/// / LM Studio). Parses the host out of the authority rather than a loose
+/// substring, so `http://localhost.evil.com` does NOT qualify.
+fn is_loopback_url(url: &str) -> bool {
+    let after = url.split("://").nth(1).unwrap_or(url);
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop any userinfo@ prefix.
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    // Bracketed IPv6 (`[::1]:port`) vs host:port.
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
+}
+
 pub fn save_key(profile: &str, key: &str) -> Result<(), String> {
     credentials::write_secret(&vault_profile(profile), "api-key", key).map_err(|e| e.to_string())
 }
@@ -102,9 +120,7 @@ pub async fn chat(
     // missing key for the hosted providers where a request without one is
     // guaranteed to bounce anyway.
     let key = credentials::read_secret(&vault_profile(&profile)).ok();
-    let needs_key = cfg.kind != "claude-code"
-        && !cfg.base_url.contains("localhost")
-        && !cfg.base_url.contains("127.0.0.1");
+    let needs_key = cfg.kind != "claude-code" && !is_loopback_url(&cfg.base_url);
     if key.is_none() && needs_key {
         emit_err(&app, "No API key saved for this provider. Add one in the AI panel settings.".into());
         return;
@@ -202,6 +218,16 @@ pub async fn chat(
             Err(e) => emit_err(&app, format!("claude CLI failed: {e}")),
         }
         return;
+    }
+
+    // Enforce HTTPS for non-loopback endpoints: an API key and the session
+    // context must never travel in cleartext to a remote host. Local providers
+    // (Ollama / LM Studio on loopback) are exempt and may use plain HTTP.
+    if !cfg.base_url.starts_with("https://") && !is_loopback_url(&cfg.base_url) {
+        return emit_err(
+            &app,
+            "Refusing to send the API key over plain HTTP to a non-local endpoint. Use an https:// URL (local Ollama / LM Studio on localhost are exempt).".into(),
+        );
     }
 
     let client = match reqwest::Client::builder().build() {
@@ -317,4 +343,26 @@ pub async fn chat(
         &topic,
         AiEvent { run_id, delta: String::new(), done: true, error: None },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_url;
+
+    #[test]
+    fn loopback_urls_allow_plain_http() {
+        // Local providers people actually use.
+        assert!(is_loopback_url("http://localhost:11434/v1")); // Ollama
+        assert!(is_loopback_url("http://127.0.0.1:1234/v1")); // LM Studio
+        assert!(is_loopback_url("http://[::1]:8080"));
+        assert!(is_loopback_url("https://localhost"));
+    }
+
+    #[test]
+    fn remote_and_lookalike_hosts_are_not_loopback() {
+        assert!(!is_loopback_url("http://api.openai.com/v1"));
+        assert!(!is_loopback_url("http://localhost.evil.com/v1")); // the trap
+        assert!(!is_loopback_url("http://127.0.0.1.evil.com"));
+        assert!(!is_loopback_url("http://user@evil.com/localhost"));
+    }
 }
