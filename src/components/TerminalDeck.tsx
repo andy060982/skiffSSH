@@ -26,6 +26,7 @@ export function TerminalDeck({
   orientation,
   sizes,
   broadcast,
+  broadcastExcluded,
   onResize,
   onResetSizes,
   onFocus,
@@ -34,6 +35,7 @@ export function TerminalDeck({
   sessions: Session[]
   /** Sessions to show, in order. */
   visibleIds: string[]
+  broadcastExcluded?: Set<string>
   focusedId: string | null
   orientation: SplitOrientation
   /** flex-grow per session id; absent means 1. */
@@ -95,7 +97,7 @@ export function TerminalDeck({
                   // Only the focused pane fans out, to the other visible panes;
                   // otherwise every pane would echo every other and loop.
                   broadcast && split && s.id === focusedId
-                    ? visibleIds.filter((id) => id !== s.id)
+                    ? visibleIds.filter((id) => id !== s.id && !broadcastExcluded?.has(id))
                     : undefined
                 }
               />

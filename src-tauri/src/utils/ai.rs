@@ -167,7 +167,24 @@ pub async fn chat(
             }
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr);
-                emit_err(&app, format!("claude CLI exited {}: {}", out.status, err.chars().take(300).collect::<String>()));
+                let err = err.trim();
+                // The most common failure is an unauthenticated CLI, which often
+                // exits non-zero with little or no stderr. Give the actual fix
+                // rather than a bare "exited 1".
+                let looks_unauthed = err.is_empty()
+                    || err.to_lowercase().contains("login")
+                    || err.to_lowercase().contains("auth")
+                    || err.to_lowercase().contains("not logged");
+                let msg = if looks_unauthed {
+                    format!(
+                        "Claude CLI exited {}. It may not be logged in — run `claude` in a terminal once to authenticate, then retry.{}",
+                        out.status,
+                        if err.is_empty() { String::new() } else { format!(" (details: {})", err.chars().take(200).collect::<String>()) }
+                    )
+                } else {
+                    format!("claude CLI exited {}: {}", out.status, err.chars().take(300).collect::<String>())
+                };
+                emit_err(&app, msg);
             }
             Err(e) => emit_err(&app, format!("claude CLI failed: {e}")),
         }

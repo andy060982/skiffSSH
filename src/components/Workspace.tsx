@@ -33,13 +33,14 @@ interface Props {
    *  guard. */
   accentHex: string | null
   broadcast: boolean
+  broadcastExcluded?: Set<string>
   onToggleBroadcast: () => void
 }
 
 export function Workspace({
   sessions, session, onChangeView, onSize, groupSessions, onFocusSession, onSplit, onSeparate,
   orientation, onToggleOrientation, paneSizes, onPaneResize, onResetPaneSizes,
-  onStartTransfer, sftpPaths, onSftpPathsChange, transferTick, accentHex, broadcast, onToggleBroadcast,
+  onStartTransfer, sftpPaths, onSftpPathsChange, transferTick, accentHex, broadcast, broadcastExcluded, onToggleBroadcast,
 }: Props) {
   if (!session || sessions.length === 0) return <EmptyState />
 
@@ -152,6 +153,7 @@ export function Workspace({
           orientation={orientation}
           sizes={paneSizes}
           broadcast={broadcast}
+          broadcastExcluded={broadcastExcluded}
           onResize={onPaneResize}
           onResetSizes={onResetPaneSizes}
           onFocus={onFocusSession}

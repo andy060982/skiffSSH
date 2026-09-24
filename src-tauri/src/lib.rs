@@ -606,6 +606,19 @@ async fn ai_config_save(config: serde_json::Value) -> CmdResult<()> {
     utils::hosts::save_named("ai.json", &config).map_err(|e| e.to_string())
 }
 
+/// App-wide settings (colour policies, device profiles, UI defaults).
+/// %APPDATA%\skiff\settings.json — opaque JSON owned by the frontend, same
+/// corrupt-tolerant contract as the host catalogue.
+#[tauri::command]
+async fn settings_load() -> CmdResult<Option<serde_json::Value>> {
+    utils::hosts::load_named("settings.json").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn settings_save(settings: serde_json::Value) -> CmdResult<()> {
+    utils::hosts::save_named("settings.json", &settings).map_err(|e| e.to_string())
+}
+
 /* -------------------------------------------------------------- credentials */
 
 /// Save a password to the Windows Credential Manager.
@@ -693,6 +706,8 @@ pub fn run() {
             ai_key_status,
             ai_config_load,
             ai_config_save,
+            settings_load,
+            settings_save,
             hosts_load,
             hosts_save,
             hosts_export,

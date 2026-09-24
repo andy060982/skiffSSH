@@ -6,6 +6,8 @@ import { SearchAddon } from '@xterm/addon-search'
 import type { Session } from '../types'
 import { safeInvoke, safeListen, inTauri } from '../lib/tauri'
 import { onLocal } from '../lib/localTerm'
+import { isDangerousCommand } from '../lib/dangerous'
+import { useSettings } from '../lib/settings'
 import { registerTerm, unregisterTerm } from '../lib/termRegistry'
 import {
   TERMINAL_FONT,
@@ -51,6 +53,9 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
   onSizeRef.current = onSize
   const broadcastRef = useRef<string[]>(broadcastTo ?? [])
   broadcastRef.current = broadcastTo ?? []
+  const { settings } = useSettings()
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
 
   useEffect(() => {
     const host = hostRef.current
@@ -96,6 +101,17 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
 
     termRef.current = term
     fitRef.current = fit
+
+    // All paste paths funnel here so the dangerous-command guard can inspect the
+    // full clipboard text before it reaches the shell; term.paste keeps
+    // bracketed-paste framing.
+    const doPaste = (text: string) => {
+      if (settingsRef.current.dangerousGuard) {
+        const reason = isDangerousCommand(text)
+        if (reason && !window.confirm(`Pasted text looks destructive (${reason}). Paste it?`)) return
+      }
+      term.paste(text)
+    }
 
     /* ---------------------------------------------------- keystrokes out */
 
@@ -148,10 +164,10 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       void navigator.clipboard
         .readText()
         .then((text) => {
-          // term.paste (not a raw send) so xterm applies bracketed-paste
-          // framing when the remote app requested it — a multi-line payload
-          // arrives inert for review instead of auto-running line by line.
-          if (text) term.paste(text)
+          // doPaste applies the dangerous-command guard, then term.paste (not a
+          // raw send) so xterm keeps bracketed-paste framing — a multi-line
+          // payload arrives inert for review instead of auto-running.
+          if (text) doPaste(text)
         })
         .catch(() => {
           term.write('\r\n\x1b[38;2;242;178;92m● clipboard read blocked\x1b[0m\r\n')
@@ -190,9 +206,8 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
         void navigator.clipboard
           .readText()
           .then((text) => {
-            // Bracketed-paste framing via term.paste — see the context-menu
-            // paste above for why a raw send is unsafe here.
-            if (text) term.paste(text)
+            // Guarded paste — see the context-menu paste above.
+            if (text) doPaste(text)
           })
           .catch(() => {
             // Clipboard read can be denied by the webview; say so rather than
@@ -204,6 +219,24 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       if (e.ctrlKey && !e.shiftKey && e.code === 'KeyC' && term.hasSelection()) {
         void navigator.clipboard.writeText(term.getSelection())
         term.clearSelection()
+        return false
+      }
+
+      // Font zoom: Ctrl +/- to resize this pane's text, Ctrl+0 to reset —
+      // like a browser. Clamped, then re-fit so the grid stays correct.
+      if (e.ctrlKey && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
+        term.options.fontSize = Math.min((term.options.fontSize ?? TERMINAL_FONT_SIZE) + 1, 32)
+        fit.fit()
+        return false
+      }
+      if (e.ctrlKey && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
+        term.options.fontSize = Math.max((term.options.fontSize ?? TERMINAL_FONT_SIZE) - 1, 8)
+        fit.fit()
+        return false
+      }
+      if (e.ctrlKey && (e.code === 'Digit0' || e.code === 'Numpad0')) {
+        term.options.fontSize = TERMINAL_FONT_SIZE
+        fit.fit()
         return false
       }
 

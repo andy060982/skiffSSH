@@ -5,6 +5,7 @@ import {
 } from 'lucide-react'
 import type { Host, Session } from '../types'
 import type { HostColor } from '../lib/hostColors'
+import { type ColorPolicy, policyFor, useSettings } from '../lib/settings'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { getTerm } from '../lib/termRegistry'
 import { scanForSecrets, type SecretHit } from '../lib/secretScan'
@@ -42,11 +43,14 @@ const PRESETS: { label: string; cfg: AiConfig }[] = [
 /** Whether the assistant may see this host's terminal output. Red-accented
  *  hosts (production, by this app's own convention) default to NO — sending a
  *  production firewall's session to any endpoint should be a deliberate act. */
-export function aiAllowedFor(host: Host | undefined, effectiveColor?: HostColor): boolean {
+export function aiAllowedFor(
+  host: Host | undefined,
+  policy: ColorPolicy,
+): boolean {
   if (!host) return false
-  // An explicit per-host choice wins; otherwise default off for red — whether
-  // the red is the host's own colour or inherited from its folder.
-  return host.aiAllowed ?? (effectiveColor ?? host.color) !== 'red'
+  // An explicit per-host choice wins; otherwise the colour policy decides
+  // (default: off for red, on for everything else — all user-configurable).
+  return host.aiAllowed ?? policy.ai !== 'off'
 }
 
 /* ---------------------------------------------------------------------------
@@ -106,7 +110,8 @@ export function AiPanel({
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
 
-  const allowed = aiAllowedFor(host, effectiveColor)
+  const { settings } = useSettings()
+  const allowed = aiAllowedFor(host, policyFor(settings, effectiveColor))
 
   /* Provider config: load once; missing config opens settings. */
   useEffect(() => {

@@ -7,6 +7,7 @@ import {
   customCommands,
   rawStartupCommands,
 } from '../lib/startupPresets'
+import { DEVICE_PROFILES } from '../lib/deviceProfiles'
 import { HOST_COLORS } from '../lib/hostColors'
 import { safeInvoke } from '../lib/tauri'
 
@@ -443,6 +444,25 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
             <span className="mb-1 block text-[10.5px] uppercase tracking-wider text-ink-faint">
               On connect
             </span>
+            {/* Device-type profile: one pick fills the on-connect + config-capture
+                commands for a platform. Not stored — the commands it sets are. */}
+            <select
+              value=""
+              onChange={(e) => {
+                const prof = DEVICE_PROFILES.find((p) => p.id === e.target.value)
+                if (!prof) return
+                setStartup(prof.startupCommands)
+                set('configCommand', prof.configCommand)
+                setShowAdvanced(true)
+              }}
+              title="Fill on-connect and config-capture commands for a device type"
+              className="mb-1.5 w-full rounded border border-line bg-surface-0 px-2 py-1 text-[12px] text-ink"
+            >
+              <option value="">Apply device type…</option>
+              {DEVICE_PROFILES.map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
             <div className="space-y-1 rounded border border-line bg-surface-1 p-2">
               {STARTUP_PRESETS.map((preset) => {
                 const on = startup.includes(preset.command)

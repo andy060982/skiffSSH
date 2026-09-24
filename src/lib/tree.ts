@@ -1,6 +1,36 @@
 import { type HostFolder, type HostNode, isFolder } from '../types'
 import type { HostColor } from './hostColors'
 
+/** Parse a dotted-quad to a u32, or null if it isn't a valid IPv4. */
+function parseIpv4(s: string): number | null {
+  const parts = s.split('.')
+  if (parts.length !== 4) return null
+  let v = 0
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null
+    const n = Number(p)
+    if (n > 255) return null
+    v = (v << 8) | n
+  }
+  return v >>> 0
+}
+
+const isCidr = (s: string) => /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(s)
+
+/** True if an IPv4 hostname falls inside a `a.b.c.d/n` subnet. Non-IPv4
+ *  hostnames (DNS names) never match a CIDR query. */
+function cidrMatch(hostname: string, cidr: string): boolean {
+  const [net, bitsStr] = cidr.split('/')
+  const bits = Number(bitsStr)
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false
+  const netN = parseIpv4(net)
+  const hostN = parseIpv4(hostname)
+  if (netN === null || hostN === null) return false
+  if (bits === 0) return true
+  const mask = (0xffffffff << (32 - bits)) >>> 0
+  return (netN & mask) === (hostN & mask)
+}
+
 /** Depth-first prune: keep a host if it matches, keep a folder if its name
  *  matches or any descendant survives. Returns the pruned tree plus the ids of
  *  every folder that must be force-expanded to reveal a match — searching a
@@ -13,13 +43,19 @@ export function filterTree(
   const expand = new Set<string>()
   if (!q) return { tree: nodes, expand }
 
-  const matches = (n: HostNode) =>
-    n.kind === 'host'
+  // A CIDR query (10.20.0.0/16) matches hosts by IP-subnet membership instead
+  // of substring — the network-engineer's "show me everything in this range".
+  const cidr = isCidr(query.trim()) ? query.trim() : null
+
+  const matches = (n: HostNode) => {
+    if (cidr) return n.kind === 'host' && cidrMatch(n.hostname, cidr)
+    return n.kind === 'host'
       ? n.name.toLowerCase().includes(q) ||
-        n.hostname.toLowerCase().includes(q) ||
-        n.username.toLowerCase().includes(q) ||
-        (n.tag?.toLowerCase().includes(q) ?? false)
+          n.hostname.toLowerCase().includes(q) ||
+          n.username.toLowerCase().includes(q) ||
+          (n.tag?.toLowerCase().includes(q) ?? false)
       : n.name.toLowerCase().includes(q)
+  }
 
   const walk = (list: HostNode[]): HostNode[] =>
     list.flatMap<HostNode>((node) => {

@@ -8,6 +8,8 @@ import { resolveStartupCommands } from '../lib/startupPresets'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { transfer as runTransfer } from '../lib/sftp'
 import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
+import { policyFor, useSettings } from '../lib/settings'
+import { isDangerousCommand } from '../lib/dangerous'
 import { clearLocal, emitLocal } from '../lib/localTerm'
 import { TitleBar } from './TitleBar'
 import { HostSidebar } from './HostSidebar'
@@ -19,6 +21,7 @@ import { StatusBar } from './StatusBar'
 import { HostKeyDialog } from './HostKeyDialog'
 import { HostEditor } from './HostEditor'
 import { HistoryBrowser } from './HistoryBrowser'
+import { SettingsDialog } from './SettingsDialog'
 import { TunnelDialog } from './TunnelDialog'
 import { FindBar } from './FindBar'
 import { TransferBar } from './TransferBar'
@@ -80,6 +83,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [configFor, setConfigFor] = useState<Host | null>(null)
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   /** hostId -> probe outcome from the last reachability sweep. */
   const [reachability, setReachability] = useState<Record<string, { ok: boolean; ms?: number }>>({})
   const [probing, setProbing] = useState(false)
@@ -113,6 +117,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   sessionsRef.current = sessions
   const hostsRef = useRef<HostNode[]>(seedHosts)
   hostsRef.current = hosts
+  const { settings } = useSettings()
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
   const sizesRef = useRef<Record<string, { cols: number; rows: number }>>({})
   sizesRef.current = sizes
   /** Sessions whose PTY has not been requested yet, keyed by session id.
@@ -330,6 +337,13 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       }
     }
 
+    // Colour policy: prompt before dialing a host whose colour (own or
+    // inherited from its folder) is configured to confirm on connect.
+    const policy = policyFor(settingsRef.current, effectiveHostColor(hostsRef.current, host.id))
+    if (policy.confirmConnect && !window.confirm(`Connect to ${host.name} (${host.hostname})?`)) {
+      return
+    }
+
     const sid = `s-${host.id}-${Date.now()}`
     const session: Session = {
       id: sid,
@@ -477,6 +491,16 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
 
   /** Closes a whole tab: every pane in that session's group. */
   const closeSession = useCallback((id: string) => {
+    // Confirm-close guard: if the setting is on and any pane in this tab is
+    // still connected, make the user acknowledge before tearing it down.
+    if (settingsRef.current.confirmCloseActive) {
+      const cur = sessionsRef.current
+      const t = cur.find((s) => s.id === id)
+      const live = cur
+        .filter((s) => (t ? s.groupId === t.groupId : s.id === id))
+        .some((s) => s.status === 'connected' || s.status === 'connecting')
+      if (live && !window.confirm('This tab has a live connection. Close it?')) return
+    }
     setSessions((prev) => {
       const target = prev.find((s) => s.id === id)
       const doomed = new Set(
@@ -597,6 +621,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
 
   /** Send a snippet to the focused pane, as if typed. */
   const sendSnippet = useCallback((sessionId: string, command: string, autoRun: boolean) => {
+    // Dangerous-command guard: a snippet carries a full command, so we can
+    // check it before it hits the wire (unlike live keystrokes).
+    if (settingsRef.current.dangerousGuard) {
+      const reason = isDangerousCommand(command)
+      if (reason && !window.confirm(`This snippet looks destructive (${reason}). Send it?`)) return
+    }
     const text = autoRun ? `${command}
 ` : command
     const bytes = Array.from(new TextEncoder().encode(text))
@@ -744,6 +774,15 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         onSelect: () => splitSession(sessionId),
       },
       {
+        label: 'Rename tab…',
+        onSelect: () => {
+          const next = window.prompt('Tab name', s.title)
+          if (next === null) return
+          const title = next.trim() || (host?.name ?? s.title)
+          setSessions((prev) => prev.map((x) => (x.id === sessionId ? { ...x, title } : x)))
+        },
+      },
+      {
         label: 'Port forwarding…',
         disabled: dead,
         onSelect: () => {
@@ -803,6 +842,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       { label: 'Quick connect… Ctrl+Shift+P', onSelect: () => setShowQuickConnect(true) },
       { label: 'Network tools…', onSelect: () => setNetTools({ target: '', port: 22 }) },
       { label: 'AI assistant… Ctrl+Shift+A', onSelect: () => setShowAi(true) },
+      { label: 'Settings…', onSelect: () => setShowSettings(true) },
       { label: 'New host…', dividerBefore: true, onSelect: () => setEditing({ host: null }) },
       {
         label: 'New folder…',
@@ -860,6 +900,16 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
    *  group drops to one pane, so a stale broadcast flag can't linger. */
   const [broadcastGroups, setBroadcastGroups] = useState<Set<string>>(new Set())
   const broadcast = active ? broadcastGroups.has(active.groupId) : false
+  /** Sessions whose colour policy keeps them out of broadcast-to-panes. */
+  const broadcastExcluded = useMemo(() => {
+    const s = new Set<string>()
+    for (const sess of sessions) {
+      if (policyFor(settings, effectiveHostColor(hosts, sess.hostId)).excludeFromBroadcast) {
+        s.add(sess.id)
+      }
+    }
+    return s
+  }, [sessions, hosts, settings])
 
   const toggleBroadcast = useCallback(() => {
     if (!active) return
@@ -1094,6 +1144,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
             transferTick={transferTick}
             accentHex={activeAccent}
             broadcast={broadcast}
+            broadcastExcluded={broadcastExcluded}
             onToggleBroadcast={toggleBroadcast}
           />
         </main>
@@ -1122,6 +1173,8 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       <HostKeyDialog />
 
       {showHistory && <HistoryBrowser onClose={() => setShowHistory(false)} />}
+
+      {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
 
       <ContextMenu menu={menu} onClose={() => setMenu(null)} />
 

@@ -9,6 +9,14 @@ work (and future contributors) inherit the reasoning, not just the code.
 Windows Credential Manager, or the freedesktop Secret Service on Linux — and the
 SSH agent is the Windows OpenSSH pipe / Pageant, or `$SSH_AUTH_SOCK` on Linux.
 
+**v0.3.0 — settings + safety:** app settings store + Settings dialog;
+**customizable host-colour policies** (per-colour AI on/off, confirm-on-connect,
+exclude-from-broadcast — the old hardcoded "red disables AI" is now a default,
+not a rule); **dangerous-command guard** (warns before a paste/snippet/broadcast
+with `rm -rf`, `reload`, `write erase`, etc.); **device-type profiles** (PAN-OS /
+IOS / Junos / Linux one-pick command fill); **subnet-aware host filter**
+(`10.20.0.0/16`); rename-tab, confirm-close-live-tab, terminal font zoom.
+
 ### Core
 - Terminal: xterm.js + WebGL, persistent scrollback across tab switches,
   split panes (columns/rows, resizable, per-pane tmux `skiff-{pane}`),
@@ -43,29 +51,6 @@ SSH agent is the Windows OpenSSH pipe / Pageant, or `$SSH_AUTH_SOCK` on Linux.
   stored as plain text under `%APPDATA%\skiff\configs\<host>\`, with
   added/removed counts on capture and unified diff between any two snapshots
 
-## v0.3.0 — scoped (agreed 2026-09-23)
-
-Theme: **settings + safety**. Introduces the app-level settings store + a
-Settings dialog; several items ride on that foundation.
-
-1. **Host-color policies (customizable)** — the centerpiece. Decouple a colour's
-   *appearance* from its *behaviour*: a per-colour policy object in settings
-   decides AI on/off/ask, confirm-on-connect, confirm-each-command,
-   exclude-from-broadcast, etc. Per-host `aiAllowed` still overrides. Introduces
-   the settings store (`settings.json` + load/save IPC, `hosts.rs` is the
-   template) + Settings dialog.
-2. **Subnet-aware sidebar filter** — `10.20.0.0/16` as a filter expression;
-   extends `filterTree`. Low-risk.
-3. **Device-type profiles** — one dropdown (PAN-OS / Cisco IOS / Linux) bundling
-   pager+width presets, config-capture command, prompt quirks. Pairs with policies.
-4. **Dangerous-command guard** — warn before `rm -rf`, `reload`, `write erase`,
-   `shutdown`, etc.; stricter on coloured hosts. Rides on the colour policies.
-5. Small wins: **custom tab titles/rename**, **confirm-close on active session**,
-   **font zoom (Ctrl +/-)**.
-
-Deferred to **v0.3.x**: nested split layouts (the one large item — recursive
-layout tree replacing the single-orientation flat model).
-
 ## Planned (backlog, rough priority)
 
 0. **Nested split layouts** — a pane full-height beside two stacked, arbitrary
@@ -81,9 +66,6 @@ layout tree replacing the single-orientation flat model).
    `show tech-support`-sized dumps.
 4. **Inventory grabber** — per-device-type `show version`/`show system info`
    parsed to CSV, for audit season.
-5. **Device-type profiles** — bundle pager/width presets, config-capture
-   command, and prompt quirks under one dropdown instead of per-field setup.
-6. **Subnet-aware sidebar filter** — `10.20.0.0/16` as a filter expression.
 7. **Remote forwarding (-R)** — -L and -D exist; -R completes the set
    (needs the Handler's forwarded-tcpip callback and a listener registry).
 7b. **Interactive auth prompts in the UI** — keyboard-interactive currently
