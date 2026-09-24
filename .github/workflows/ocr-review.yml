@@ -93,5 +93,10 @@ jobs:
           llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
           llm_model: ${{ vars.OCR_LLM_MODEL }}
           llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          # Pass the PR number explicitly. v1.12.9's auto-resolution from the
+          # event payload failed ("event 'unknown' carries no number"), so name
+          # it: pull_request_target -> event.pull_request.number, issue_comment
+          # -> event.issue.number.
+          pr_number: ${{ github.event.pull_request.number || github.event.issue.number }}
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}
