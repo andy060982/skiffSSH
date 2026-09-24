@@ -529,8 +529,8 @@ async fn ssh_copy_id(
 async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     use russh::keys::ssh_key::{self, getrandom::SysRng, rand_core::UnwrapErr, LineEnding};
 
-    let home = std::env::var_os("USERPROFILE").ok_or("no USERPROFILE")?;
-    let dir = std::path::PathBuf::from(home).join(".ssh");
+    let home = utils::platform::home_dir().ok_or("could not determine home directory")?;
+    let dir = home.join(".ssh");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     // Never clobber an existing key: a keypair someone already deployed to

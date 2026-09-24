@@ -128,9 +128,22 @@ pub async fn chat(
         }
         prompt.push_str("Assistant:");
 
-        let mut cmd = tokio::process::Command::new("cmd");
-        cmd.args(["/C", "claude", "-p", "--output-format", "text"])
-            .stdin(std::process::Stdio::piped())
+        // Launch the Claude CLI natively per platform: `cmd /C claude ...` on
+        // Windows (so PATH/.cmd shim resolution works and no console flashes),
+        // and `claude ...` directly on macOS/Linux (there is no `cmd`).
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/C", "claude", "-p", "--output-format", "text"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("claude");
+            c.args(["-p", "--output-format", "text"]);
+            c
+        };
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         #[cfg(windows)]

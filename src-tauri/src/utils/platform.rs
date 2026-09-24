@@ -41,17 +41,31 @@ pub fn reveal_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The current user's home directory, resolved through the platform's own
+/// environment variable (`USERPROFILE` on Windows, `HOME` on macOS/Linux).
+/// Keeping this in one place stops Windows-only assumptions (`USERPROFILE`)
+/// from leaking into cross-platform code paths like key generation.
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
 /// Best-effort user "Documents" directory for exports. Falls back to the home
 /// directory when there is no Documents folder.
 pub fn documents_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Documents"))
+        home_dir().map(|p| p.join("Documents"))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        std::env::var_os("HOME").map(|p| {
-            let home = PathBuf::from(p);
+        home_dir().map(|home| {
             let docs = home.join("Documents");
             if docs.is_dir() {
                 docs
