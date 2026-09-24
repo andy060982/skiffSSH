@@ -1,6 +1,18 @@
+import { sep } from '@tauri-apps/api/path'
 import type { DirListing, PaneSide } from '../types'
 import { safeInvoke, inTauri } from './tauri'
 import { mockLocalListing, mockRemoteListing } from '../data/mockHosts'
+
+/** Separator for LOCAL paths — the current machine's, via Tauri. Remote paths
+ *  are always POSIX. Falls back to "/" outside the Tauri runtime (browser
+ *  preview / tests) so this never throws. */
+function localSep(): string {
+  try {
+    return sep()
+  } catch {
+    return '/'
+  }
+}
 
 /* ---------------------------------------------------------------------------
    The only module that knows command names. Everything above it works in terms
@@ -43,11 +55,18 @@ export function joinPath(side: PaneSide, base: string, name: string): string {
   if (side === 'remote') {
     return base === '/' ? `/${name}` : `${base.replace(/\/+$/, '')}/${name}`
   }
-  return base.endsWith('\\') ? `${base}${name}` : `${base}\\${name}`
+  const s = localSep()
+  return base.endsWith(s) ? `${base}${name}` : `${base}${s}${name}`
 }
 
 export function parentPath(side: PaneSide, path: string): string {
   if (side === 'remote') {
+    const trimmed = path.replace(/\/+$/, '')
+    const cut = trimmed.lastIndexOf('/')
+    return cut <= 0 ? '/' : trimmed.slice(0, cut)
+  }
+  if (localSep() === '/') {
+    // POSIX local (macOS/Linux): same rules as a remote POSIX path.
     const trimmed = path.replace(/\/+$/, '')
     const cut = trimmed.lastIndexOf('/')
     return cut <= 0 ? '/' : trimmed.slice(0, cut)
@@ -59,7 +78,7 @@ export function parentPath(side: PaneSide, path: string): string {
 }
 
 export function basename(side: PaneSide, path: string): string {
-  const sep = side === 'remote' ? '/' : '\\'
-  const parts = path.split(sep).filter(Boolean)
+  const separator = side === 'remote' ? '/' : localSep()
+  const parts = path.split(separator).filter(Boolean)
   return parts[parts.length - 1] ?? path
 }

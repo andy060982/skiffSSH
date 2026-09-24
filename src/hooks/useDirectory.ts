@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FileEntry, PaneSide } from '../types'
-import { listDirectory, parentPath } from '../lib/sftp'
+import { listDirectory, parentPath, joinPath } from '../lib/sftp'
 
 export type SortKey = 'name' | 'size' | 'modified'
 
@@ -67,9 +67,7 @@ export function useDirectory(side: PaneSide, sessionId: string, initialPath: str
     const target =
       entry.name === '..'
         ? parentPath(side, currentPath)
-        : side === 'remote'
-          ? `${currentPath.replace(/\/+$/, '')}/${entry.name}`
-          : `${currentPath.replace(/\\+$/, '')}\\${entry.name}`
+        : joinPath(side, currentPath, entry.name)
     void read(target)
   }, [read, side])
 

@@ -7,8 +7,20 @@ import { joinPath } from '../lib/sftp'
 import { onFileDrop, safeInvoke } from '../lib/tauri'
 import { ContextMenu, type MenuState } from './ContextMenu'
 import { X } from 'lucide-react'
+import { sep } from '@tauri-apps/api/path'
 
-const DEFAULT_LOCAL = 'C:\\'
+/** A valid, listable local starting directory for the current OS. The app opens
+ *  the local pane at the filesystem root (as it already did on Windows with
+ *  "C:\\"); this returns the correct root per platform instead of a hardcoded
+ *  "C:\\" that doesn't exist on macOS/Linux. `sep()` distinguishes Windows
+ *  ("\\") from POSIX ("/"). */
+function defaultLocal(): string {
+  try {
+    return sep() === '\\' ? 'C:\\' : '/'
+  } catch {
+    return '/'
+  }
+}
 const DEFAULT_REMOTE = '/'
 
 /** Dual-pane transfer surface: local on the left, remote on the right.
@@ -43,7 +55,7 @@ export function SftpView({
 }) {
   const [ratio, setRatio] = useState(0.5)
   const [focus, setFocus] = useState<PaneSide>('local')
-  const [localPath, setLocalPath] = useState(savedPaths?.local ?? DEFAULT_LOCAL)
+  const [localPath, setLocalPath] = useState(savedPaths?.local ?? defaultLocal())
   const [remotePath, setRemotePath] = useState(savedPaths?.remote ?? DEFAULT_REMOTE)
   // Current paths for the drop handler, which subscribes once.
   const remoteRef = useRef(remotePath)
@@ -319,7 +331,7 @@ export function SftpView({
           <FilePane
             side="local"
             sessionId={session.id}
-            initialPath={savedPaths?.local ?? DEFAULT_LOCAL}
+            initialPath={savedPaths?.local ?? defaultLocal()}
             focused={focus === 'local'}
             onFocus={() => setFocus('local')}
             onPathChange={setLocalPath}
