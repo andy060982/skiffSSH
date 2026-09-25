@@ -12,11 +12,56 @@
 //! keyed by host id; this holds names, addresses, ports, usernames, and auth
 //! *method*. That separation is why this file can be plain, readable JSON.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde_json::Value;
 
 use super::known_hosts::KnownHostsError;
+
+/// Serialises every catalogue/settings write so two concurrent saves can neither
+/// interleave on a shared scratch file nor race on the final replace.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// Makes each temp filename unique even within a burst of same-process saves.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Write `contents` to `path` as atomically as the platform allows.
+///
+/// A unique temp sibling is written in full, then rename-replaced over the
+/// destination. `std::fs::rename` is an atomic replace on Unix and on modern
+/// Windows; only if that fails do we fall back to remove-then-rename, and the
+/// unique temp (never the shared one the old code used) is still intact on disk
+/// if we crash in that narrow window. The whole operation is serialised
+/// process-wide, so concurrent saves cannot lose data or clobber each other.
+fn write_atomic(path: &Path, contents: &str) -> Result<(), KnownHostsError> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
+    std::fs::write(&tmp, contents).map_err(|source| KnownHostsError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+
+    if std::fs::rename(&tmp, path).is_err() {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|source| KnownHostsError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        std::fs::rename(&tmp, path).map_err(|source| {
+            // Do not leave the scratch file behind if the replace truly failed.
+            let _ = std::fs::remove_file(&tmp);
+            KnownHostsError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
 
 /// `%APPDATA%\skiff\hosts.json`, beside known_hosts.
 fn hosts_path() -> Result<PathBuf, KnownHostsError> {
@@ -60,14 +105,9 @@ pub fn load() -> Result<Option<Value>, KnownHostsError> {
     }
 }
 
-/// Write the catalogue atomically.
-///
-/// Write-to-temp-then-rename, because the naive truncate-and-write loses the
-/// entire host list if the process dies mid-write — and on Windows `rename`
-/// over an existing file needs the remove-then-rename dance or `ReplaceFileW`.
-/// `fs::rename` on Windows fails if the destination exists, so the temp file is
-/// persisted with `std::fs::rename` only after the original is removed, and the
-/// window between the two is the one failure mode left.
+/// Write the catalogue atomically. Losing the host list to a mid-write crash
+/// would be a real data-loss bug, so this goes through `write_atomic`
+/// (unique temp, rename-replace, process-wide serialisation).
 pub fn save(tree: &Value) -> Result<(), KnownHostsError> {
     let path = hosts_path()?;
 
@@ -80,32 +120,7 @@ pub fn save(tree: &Value) -> Result<(), KnownHostsError> {
 
     let pretty = serde_json::to_string_pretty(tree)
         .map_err(|e| KnownHostsError::Parse(e.to_string()))?;
-
-    // Unique temp name (pid-scoped) so two concurrent saves can't stomp the
-    // same scratch file and interleave each other's bytes.
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, pretty).map_err(|source| KnownHostsError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-
-    // Try an atomic rename-replace first (works on Unix, and on Windows where
-    // std::fs::rename replaces an existing file). Only if that fails do we fall
-    // back to remove-then-rename — the one window where a crash could lose the
-    // file — and even then the unique temp above is still intact on disk.
-    if std::fs::rename(&tmp, &path).is_err() {
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|source| KnownHostsError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        }
-        std::fs::rename(&tmp, &path).map_err(|source| KnownHostsError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    }
-    Ok(())
+    write_atomic(&path, &pretty)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -146,7 +161,7 @@ pub fn save_sessions(list: &Value) -> Result<(), KnownHostsError> {
     }
     let text = serde_json::to_string_pretty(list)
         .map_err(|e| KnownHostsError::Parse(e.to_string()))?;
-    std::fs::write(&path, text).map_err(|source| KnownHostsError::Io { path, source })
+    write_atomic(&path, &text)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -179,5 +194,5 @@ pub fn save_named(name: &str, value: &Value) -> Result<(), KnownHostsError> {
     let path = dir.join(name);
     let text =
         serde_json::to_string_pretty(value).map_err(|e| KnownHostsError::Parse(e.to_string()))?;
-    std::fs::write(&path, text).map_err(|source| KnownHostsError::Io { path, source })
+    write_atomic(&path, &text)
 }
