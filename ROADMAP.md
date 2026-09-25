@@ -82,10 +82,9 @@ IOS / Junos / Linux one-pick command fill); **subnet-aware host filter**
     current need.
 11. **Trace-path visualisation** — run traceroute from inside a session and
     render hops; nice, not core.
-12. **macOS port** — the credential-store/agent abstraction now exists
-    (Windows Credential Manager / Linux Secret Service / `$SSH_AUTH_SOCK`), so
-    macOS only needs a signed + notarised build produced on a mac runner.
-    **Linux shipped in v0.2.0.**
+
+_All three desktop platforms now ship: Windows + Linux (v0.2.0), macOS (v0.3.0,
+signed + notarised Developer ID `.dmg`; `macos-latest` in CI)._
 
 ## Deliberately rejected
 
@@ -99,9 +98,6 @@ IOS / Junos / Linux one-pick command fill); **subnet-aware host filter**
   is a change-control incident. The on-connect field lets users opt in.
 - **"Don't ask again" on host-key prompts** — accepting already records the
   key; a broader suppression toggle only silences the one warning that matters.
-- **Nested split-pane layout trees** — flat groups cover the real use
-  (htop above, shell below); a layout tree brings focus traversal,
-  serialisation, and drag-rearrange complexity nobody asked for.
 
 ## Invariants (see SECURITY.md — breaking these is a bug even if tests pass)
 
