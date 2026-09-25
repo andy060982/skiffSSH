@@ -108,14 +108,36 @@ impl NetTools {
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+        // kill_on_drop is what actually terminates the child on cancel: aborting
+        // the task below drops this `child`, and without this flag tokio leaves
+        // the ping/traceroute running as an orphan. With it, the OS process is
+        // killed and reaped when the task is aborted.
+        cmd.kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = cmd.spawn().map_err(|e| format!("{program}: {e}"))?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        let stderr = child.stderr.take().ok_or("no stderr")?;
 
         let rid = run_id.clone();
         let task = tokio::spawn(async move {
+            // Stream stderr in parallel so a failure's message ("unknown host",
+            // "operation not permitted") reaches the user instead of being
+            // silently swallowed. When the child ends or is killed its stderr
+            // pipe closes, ending this reader.
+            let err_app = app.clone();
+            let err_rid = rid.clone();
+            let err_reader = tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = err_app.emit(
+                        &format!("net://{err_rid}"),
+                        ToolEvent { run_id: err_rid.clone(), line, done: false },
+                    );
+                }
+            });
+
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = app.emit(
@@ -123,10 +145,20 @@ impl NetTools {
                     ToolEvent { run_id: rid.clone(), line, done: false },
                 );
             }
-            let _ = child.wait().await;
+            let _ = err_reader.await;
+
+            // Report a non-zero or failed exit rather than concealing it behind
+            // a clean "done": a traceroute that could not resolve its target
+            // should not look identical to a successful one.
+            let status = child.wait().await;
+            let final_line = match status {
+                Ok(s) if s.success() => String::new(),
+                Ok(s) => format!("[process exited with {s}]"),
+                Err(e) => format!("[could not wait for process: {e}]"),
+            };
             let _ = app.emit(
                 &format!("net://{rid}"),
-                ToolEvent { run_id: rid.clone(), line: String::new(), done: true },
+                ToolEvent { run_id: rid.clone(), line: final_line, done: true },
             );
         });
         self.runs.insert(run_id, task);
