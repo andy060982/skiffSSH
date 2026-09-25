@@ -499,6 +499,30 @@ async fn config_read(host: String, name: String) -> CmdResult<String> {
     utils::configs::read_snapshot(&host, &name).map_err(|e| e.to_string())
 }
 
+/// Run one command over a fresh hidden exec channel and save its output to a
+/// timestamped file under the host's captures folder — "log just this command's
+/// output" for a `show tech-support`-sized dump, without it scrolling past in
+/// the terminal. Same exec-capture path (and 16 MiB cap) as a config snapshot.
+#[tauri::command]
+async fn capture_output(
+    registry: State<'_, Registry>,
+    session_id: String,
+    host: String,
+    command: String,
+) -> CmdResult<utils::captures::CaptureResult> {
+    let output = registry
+        .exec_capture(&session_id, &command, 120)
+        .await
+        .map_err(|e| e.to_string())?;
+    if output.trim().is_empty() {
+        return Err(
+            "capture returned nothing — the device may not support exec-channel commands"
+                .to_string(),
+        );
+    }
+    utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string())
+}
+
 /// Generate an Ed25519 keypair into ~/.ssh, returning the private-key path
 /// and the public key line to paste into a server's authorized_keys.
 ///
@@ -757,6 +781,7 @@ pub fn run() {
             net_dns_lookup,
             hosts_probe,
             config_snapshot,
+            capture_output,
             config_list,
             config_diff,
             config_read,
