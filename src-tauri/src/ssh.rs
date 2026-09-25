@@ -1623,23 +1623,55 @@ async fn copy_local_file(
 ) -> Result<u64, SshError> {
     let total = tokio::fs::metadata(local).await.map(|m| m.len()).unwrap_or(0);
     let mut src = tokio::fs::File::open(local).await?;
-    let mut dst = sftp.create(remote).await?;
 
-    let mut reporter = Reporter::new(app, session_id, local, total, "upload");
-    let mut buf = vec![0u8; CHUNK];
-    let mut done = 0u64;
-    loop {
-        let n = src.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    // Stream to a unique temp file beside the destination, then rename over it,
+    // exactly as the download does. `sftp.create` truncates, so writing straight
+    // to `remote` would destroy the existing file the moment the transfer began:
+    // a connection drop, disk-full, or cancel would then leave a truncated
+    // remote file with the original gone.
+    let tmp = temp_sibling(remote);
+    let copy_result: Result<u64, SshError> = async {
+        let mut dst = sftp.create(&tmp).await?;
+        let mut reporter = Reporter::new(app, session_id, local, total, "upload");
+        let mut buf = vec![0u8; CHUNK];
+        let mut done = 0u64;
+        loop {
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n]).await?;
+            done += n as u64;
+            reporter.tick(done);
         }
-        dst.write_all(&buf[..n]).await?;
-        done += n as u64;
-        reporter.tick(done);
+        // shutdown (not just flush) closes the remote handle, which must happen
+        // before the rename and also avoids leaking the SFTP handle.
+        dst.shutdown().await?;
+        reporter.finish(done);
+        Ok(done)
     }
-    dst.flush().await?;
-    reporter.finish(done);
-    Ok(done)
+    .await;
+
+    match copy_result {
+        Ok(done) => {
+            // Atomic replace. SSH_FXP_RENAME does not universally replace an
+            // existing target, so if the direct rename fails, remove the
+            // destination and retry — mirroring the local-side fallback.
+            if sftp.rename(tmp.clone(), remote.to_string()).await.is_err() {
+                let _ = sftp.remove_file(remote.to_string()).await;
+                if let Err(e) = sftp.rename(tmp.clone(), remote.to_string()).await {
+                    let _ = sftp.remove_file(tmp).await;
+                    return Err(e.into());
+                }
+            }
+            Ok(done)
+        }
+        Err(e) => {
+            // Leave the original untouched; drop the partial temp.
+            let _ = sftp.remove_file(tmp).await;
+            Err(e)
+        }
+    }
 }
 
 /* ------------------------------------------------------------- progress */
