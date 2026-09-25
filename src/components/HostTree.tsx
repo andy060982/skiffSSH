@@ -41,6 +41,7 @@ export function HostTree({
               onClick={() => onToggle(node.id)}
               onContextMenu={(e) => {
                 e.preventDefault()
+                e.stopPropagation() // don't also trigger the sidebar background menu
                 onFolderMenu(node.id, node.name, e.clientX, e.clientY)
               }}
               style={{
@@ -142,6 +143,7 @@ function HostRow({
       onDoubleClick={() => onOpen(host)}
       onContextMenu={(e) => {
         e.preventDefault()
+        e.stopPropagation() // don't also trigger the sidebar background menu
         onMenu(host, e.clientX, e.clientY)
       }}
       onKeyDown={(e) => e.key === 'Enter' && onOpen(host)}
