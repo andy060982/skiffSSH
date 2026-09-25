@@ -41,6 +41,22 @@ pub fn reveal_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Restrict a path to the owner only — `0700` for a directory, `0600` for a
+/// file. Best-effort: a failure to chmod must not sink the operation that
+/// created the path, so the result is discarded.
+///
+/// Unix only. On Windows these artifacts live under the per-user profile, whose
+/// ACLs already exclude other standard users; tightening NTFS ACLs further is a
+/// separate, larger change and not what this bug is about.
+#[cfg(unix)]
+pub fn restrict_perms(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+pub fn restrict_perms(_path: &Path, _mode: u32) {}
+
 /// The current user's home directory, resolved through the platform's own
 /// environment variable (`USERPROFILE` on Windows, `HOME` on macOS/Linux).
 /// Keeping this in one place stops Windows-only assumptions (`USERPROFILE`)

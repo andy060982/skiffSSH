@@ -67,6 +67,9 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
         path: dir.clone(),
         source,
     })?;
+    // A device config dump can hold SNMP communities, pre-shared keys, and other
+    // secrets, so keep the per-host snapshot directory owner-only.
+    super::platform::restrict_perms(&dir, 0o700);
 
     let previous = newest(&dir);
 
@@ -80,6 +83,7 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
         path: path.clone(),
         source,
     })?;
+    super::platform::restrict_perms(&path, 0o600);
 
     let (added, removed) = match previous {
         Some(prev_path) => {
