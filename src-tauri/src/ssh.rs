@@ -1183,20 +1183,24 @@ async fn authenticate(
         // single hidden "Password:" question. Users should not need to know
         // which of the two dances their firewall does.
         _ => {
-            let pw: String = match one_shot_password {
-                Some(p) => p.to_string(),
-                None => credentials::read_secret(host_id)?.as_str().to_string(),
+            // Hold the working copy in Zeroizing so it is wiped on EVERY exit
+            // path: the old code copied the secret into a plain String and only
+            // wiped it after both awaits succeeded, so a failed `?` between them
+            // (or a cancellation) left the plaintext in the heap. read_secret
+            // already returns Zeroizing; a one-shot password is wrapped to match.
+            // The previous `unsafe { as_mut_vec().fill(0) }` is gone — fill(0) is
+            // not a guaranteed zeroization primitive, and Zeroizing::drop is.
+            let pw: zeroize::Zeroizing<String> = match one_shot_password {
+                Some(p) => zeroize::Zeroizing::new(p.to_string()),
+                None => credentials::read_secret(host_id)?,
             };
             let result = handle.authenticate_password(username, pw.as_str()).await?;
-            let result = if matches!(result, russh::client::AuthResult::Success) {
+            if matches!(result, russh::client::AuthResult::Success) {
                 result
             } else {
-                keyboard_interactive_with_password(handle, username, &pw).await?
-            };
-            // Best-effort wipe of the working copy.
-            let mut pw = pw;
-            unsafe { pw.as_mut_vec().fill(0) };
-            result
+                keyboard_interactive_with_password(handle, username, pw.as_str()).await?
+            }
+            // `pw` drops here — or at any `?` above — zeroizing its buffer.
         }
     };
 
