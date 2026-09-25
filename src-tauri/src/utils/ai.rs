@@ -230,7 +230,14 @@ pub async fn chat(
         );
     }
 
-    let client = match reqwest::Client::builder().build() {
+    // Do NOT follow redirects: a 3xx from the endpoint could otherwise bounce
+    // the request — API key and session context included — to an arbitrary host,
+    // defeating the HTTPS-origin check above. An LLM completion endpoint has no
+    // legitimate reason to redirect.
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return emit_err(&app, e.to_string()),
     };
