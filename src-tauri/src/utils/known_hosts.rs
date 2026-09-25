@@ -64,9 +64,13 @@ pub enum HostKeyStatus {
     Trusted,
     /// No entry for this host — a first connection.
     Unknown,
-    /// An entry exists with a *different* key of the same algorithm. Either the
-    /// server was rebuilt or the connection is being intercepted.
+    /// An entry exists with a *different* key (any algorithm) for this host, or
+    /// no stored key matches. Either the server was rebuilt or the connection is
+    /// being intercepted — refuse, never prompt.
     Changed { line: usize },
+    /// The presented key is explicitly revoked (`@revoked` line). Refuse
+    /// unconditionally — this beats any matching trust entry.
+    Revoked { line: usize },
 }
 
 /// `%APPDATA%\skiff\known_hosts` on Windows.
@@ -130,12 +134,23 @@ pub fn ensure_store() -> Result<PathBuf, KnownHostsError> {
 /// Genuine IO problems still surface when `trust` tries to write.
 pub fn check(host: &str, port: u16, key: &PublicKey) -> Result<HostKeyStatus, KnownHostsError> {
     let path = ensure_store()?;
-    Ok(classify(host, port, key, &path))
+    classify(host, port, key, &path)
 }
 
-fn classify(host: &str, port: u16, key: &PublicKey, path: &Path) -> HostKeyStatus {
+fn classify(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+) -> Result<HostKeyStatus, KnownHostsError> {
+    // Revocation wins over everything: an explicitly `@revoked` key is refused
+    // even if the same key also appears as a normal trust entry.
+    if let Some(line) = revoked_line(host, port, key, path)? {
+        return Ok(HostKeyStatus::Revoked { line });
+    }
+
     match check_known_hosts_path(host, port, key, path) {
-        Ok(true) => HostKeyStatus::Trusted,
+        Ok(true) => Ok(HostKeyStatus::Trusted),
         Ok(false) => {
             // russh found no key on file matching the presented one. That is
             // NOT automatically "unknown host": russh only reports KeyChanged
@@ -146,35 +161,90 @@ fn classify(host: &str, port: u16, key: &PublicKey, path: &Path) -> HostKeyStatu
             //   - host IS on file, key isn't -> treat as Changed -> refuse,
             //     never a silent trust prompt. Recovery is explicit: remove the
             //     host's known_hosts line, then reconnect to re-trust.
-            match host_entry_line(host, port, path) {
-                Some(line) => HostKeyStatus::Changed { line },
-                None => HostKeyStatus::Unknown,
+            match host_entry_line(host, port, path)? {
+                Some(line) => Ok(HostKeyStatus::Changed { line }),
+                None => Ok(HostKeyStatus::Unknown),
             }
         }
-        Err(russh::keys::Error::KeyChanged { line }) => HostKeyStatus::Changed { line },
-        // Anything else (missing file, unreadable line) is treated as "we have
-        // no opinion", which routes to the prompt rather than silent acceptance.
-        Err(_) => HostKeyStatus::Unknown,
+        Err(russh::keys::Error::KeyChanged { line }) => Ok(HostKeyStatus::Changed { line }),
+        // Any OTHER error — an unreadable or corrupt store, a malformed line —
+        // is propagated, NOT downgraded to a trust prompt. The store exists by
+        // this point (ensure_store created it), so a read/parse failure here is
+        // a real problem: fail closed and make the user fix the file rather than
+        // let a parse error masquerade as a first-use connection.
+        Err(e) => Err(KnownHostsError::Parse(format!(
+            "could not verify {host}:{port} against the known_hosts store: {e}"
+        ))),
     }
 }
 
-/// The 1-based line number of the first known_hosts entry naming this host
-/// (plaintext host fields only — hashed `|1|…` entries can't be matched by
-/// name, but Skiff writes plaintext). `None` if the host is absent entirely.
-fn host_entry_line(host: &str, port: u16, path: &Path) -> Option<usize> {
+/// The 1-based line of a `@revoked` entry naming this host whose key matches the
+/// presented one, if any. Read/parse failure of the store propagates (fail
+/// closed); an unparseable individual `@revoked` line is skipped, not fatal.
+fn revoked_line(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+) -> Result<Option<usize>, KnownHostsError> {
     let needle = if port == 22 {
         host.to_string()
     } else {
         format!("[{host}]:{port}")
     };
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = std::fs::read_to_string(path).map_err(|source| KnownHostsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let mut fields = line.split_whitespace();
-        let mut first = fields.next()?;
+        if !matches!(fields.next(), Some(m) if m.eq_ignore_ascii_case("@revoked")) {
+            continue;
+        }
+        let Some(host_field) = fields.next() else { continue };
+        if !host_field.split(',').any(|h| h.eq_ignore_ascii_case(&needle)) {
+            continue;
+        }
+        let (Some(key_type), Some(b64)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        // Reassemble the "type base64" openssh form and compare key material.
+        if let Ok(revoked) = PublicKey::from_openssh(&format!("{key_type} {b64}")) {
+            if revoked.key_data() == key.key_data() {
+                return Ok(Some(i + 1));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The 1-based line number of the first known_hosts entry naming this host
+/// (plaintext host fields only — hashed `|1|…` entries can't be matched by
+/// name, but Skiff writes plaintext). `None` if the host is absent entirely.
+fn host_entry_line(host: &str, port: u16, path: &Path) -> Result<Option<usize>, KnownHostsError> {
+    let needle = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    // Propagate a read failure rather than swallowing it: a store that exists
+    // but can't be read must fail the check closed, not report "host absent"
+    // (which routes to a trust prompt).
+    let text = std::fs::read_to_string(path).map_err(|source| KnownHostsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(mut first) = fields.next() else { continue };
         // Skip an @revoked / @cert-authority marker to reach the host field.
         if first.starts_with('@') {
             first = match fields.next() {
@@ -184,10 +254,10 @@ fn host_entry_line(host: &str, port: u16, path: &Path) -> Option<usize> {
         }
         // Host field may be a comma-separated list of patterns.
         if first.split(',').any(|h| h.eq_ignore_ascii_case(&needle)) {
-            return Some(i + 1);
+            return Ok(Some(i + 1));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Append a host's public key to the store, creating the directory and file if
@@ -199,11 +269,20 @@ fn host_entry_line(host: &str, port: u16, path: &Path) -> Option<usize> {
 pub fn trust(host: &str, port: u16, key: &PublicKey) -> Result<(), KnownHostsError> {
     let path = ensure_store()?;
 
-    if let HostKeyStatus::Changed { line } = classify(host, port, key, &path) {
-        return Err(KnownHostsError::Parse(format!(
-            "{host}:{port} already has a different key on line {line}; \
-             remove it by hand before trusting a new one"
-        )));
+    match classify(host, port, key, &path)? {
+        HostKeyStatus::Changed { line } => {
+            return Err(KnownHostsError::Parse(format!(
+                "{host}:{port} already has a different key on line {line}; \
+                 remove it by hand before trusting a new one"
+            )))
+        }
+        HostKeyStatus::Revoked { line } => {
+            return Err(KnownHostsError::Parse(format!(
+                "{host}:{port} presented a key that is revoked on line {line}; \
+                 refusing to trust it"
+            )))
+        }
+        HostKeyStatus::Trusted | HostKeyStatus::Unknown => {}
     }
 
     // russh handles the details that are easy to get wrong: appending a leading
