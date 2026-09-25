@@ -1307,24 +1307,41 @@ pub async fn copy_id(
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
     let mut out = Vec::new();
+    let mut exit_status: Option<u32> = None;
     let collect = async {
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
                     out.extend_from_slice(data)
                 }
+                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
                 ChannelMsg::Eof | ChannelMsg::Close => break,
                 _ => {}
             }
         }
     };
-    let _ = tokio::time::timeout(Duration::from_secs(20), collect).await;
+    // A timeout is a failure, not a silent success: don't judge the run by
+    // whatever partial output happened to arrive before the clock ran out.
+    let completed = tokio::time::timeout(Duration::from_secs(20), collect)
+        .await
+        .is_ok();
 
-    if String::from_utf8_lossy(&out).contains("SKIFF_KEY_OK") {
+    // Three signals must agree before we claim the key is installed:
+    //   - the command actually finished within the timeout,
+    //   - any exit status it reported was 0 (missing status is tolerated, as
+    //     some servers close the channel without sending one — the marker below
+    //     is the primary positive proof), and
+    //   - the conjunctive `&&` chain printed its end marker, which it only does
+    //     if every step (including the append) succeeded.
+    // Deciding on the marker alone let a non-zero exit or a truncated/timed-out
+    // run be reported as success.
+    let marker = String::from_utf8_lossy(&out).contains("SKIFF_KEY_OK");
+    let exit_ok = exit_status.map_or(true, |code| code == 0);
+    if completed && exit_ok && marker {
         Ok(())
     } else {
         Err(SshError::AuthFailed(format!(
-            "install command did not confirm success: {}",
+            "install did not confirm success (completed={completed}, exit={exit_status:?}): {}",
             String::from_utf8_lossy(&out).chars().take(200).collect::<String>()
         )))
     }
