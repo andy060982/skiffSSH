@@ -86,6 +86,10 @@ pub struct SessionLog {
     /// be split between two reads, and a stripper with no memory would emit the
     /// tail of it as text.
     partial: Vec<u8>,
+    /// Bytes written so far, to enforce a per-session size cap.
+    written: u64,
+    /// Set once the cap is hit so the truncation notice is written only once.
+    capped: bool,
 }
 
 impl SessionLog {
@@ -124,6 +128,8 @@ impl SessionLog {
             file,
             path,
             partial: Vec::new(),
+            written: 0,
+            capped: false,
         })
     }
 
@@ -137,14 +143,38 @@ impl SessionLog {
     /// entire point, and terminal output is far too low-volume for the syscall
     /// to matter.
     pub fn append(&mut self, chunk: &[u8]) {
+        // Per-session on-disk cap: a runaway remote (`yes`, `cat` of a huge
+        // file) must not be able to fill the disk through the transcript. Once
+        // the cap is reached, note it once and stop appending.
+        const MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
+        if self.capped {
+            return;
+        }
+
         let mut buf = std::mem::take(&mut self.partial);
         buf.extend_from_slice(chunk);
 
-        let (text, leftover) = strip_ansi(&buf);
+        let (text, mut leftover) = strip_ansi(&buf);
+        // Bound the pending-escape carry-over. A real control sequence is a
+        // handful of bytes; a multi-KB "unterminated sequence" is a broken or
+        // hostile server growing this buffer without bound, so drop it rather
+        // than re-prepend it on every future chunk.
+        const MAX_PENDING: usize = 64 * 1024;
+        if leftover.len() > MAX_PENDING {
+            leftover.clear();
+        }
         self.partial = leftover;
 
         if !text.is_empty() {
             let _ = self.file.write_all(&text);
+            self.written = self.written.saturating_add(text.len() as u64);
+            if self.written >= MAX_LOG_BYTES {
+                let _ = writeln!(
+                    self.file,
+                    "\n=== transcript truncated: {MAX_LOG_BYTES}-byte session cap reached ==="
+                );
+                self.capped = true;
+            }
             let _ = self.file.flush();
         }
     }
