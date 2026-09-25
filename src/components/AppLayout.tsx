@@ -19,6 +19,7 @@ import { Workspace } from './Workspace'
 import type { SplitOrientation } from './TerminalDeck'
 import { StatusBar } from './StatusBar'
 import { HostKeyDialog } from './HostKeyDialog'
+import { AuthPromptDialog } from './AuthPromptDialog'
 import { HostEditor } from './HostEditor'
 import { HistoryBrowser } from './HistoryBrowser'
 import { SettingsDialog } from './SettingsDialog'
@@ -1242,6 +1243,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       {/* Rendered at the shell root so the modal covers the whole window; it
           self-hides until the backend raises a prompt. */}
       <HostKeyDialog />
+      <AuthPromptDialog />
 
       {showHistory && <HistoryBrowser onClose={() => setShowHistory(false)} />}
 

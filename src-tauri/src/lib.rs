@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 
 use tauri::{AppHandle, Manager, State};
 
-use ssh::{DirListing, FileEntry, HostKeyPrompts, Registry};
+use ssh::{AuthPrompts, DirListing, FileEntry, HostKeyPrompts, Registry};
 use std::sync::Arc;
 
 /// Commands return `Result<_, String>`: Tauri needs a serialisable error, and a
@@ -22,6 +22,7 @@ async fn ssh_connect(
     app: AppHandle,
     registry: State<'_, Registry>,
     prompts: State<'_, Arc<HostKeyPrompts>>,
+    auth_prompts: State<'_, Arc<AuthPrompts>>,
     session_id: String,
     host_id: String,
     host: String,
@@ -39,6 +40,7 @@ async fn ssh_connect(
         .connect(
             app,
             Arc::clone(&prompts),
+            Arc::clone(&auth_prompts),
             &session_id,
             &host_id,
             &host,
@@ -68,6 +70,21 @@ async fn host_key_respond(
     accept: bool,
 ) -> CmdResult<()> {
     prompts.respond(&request_id, accept);
+    Ok(())
+}
+
+/// Answer a keyboard-interactive challenge raised by `ssh://auth-prompt`.
+///
+/// `answers` are the user's typed responses, one per ECHO prompt shown (in
+/// order). Hidden prompts are never surfaced and are answered with the stored
+/// password in the backend, so no password is passed in here.
+#[tauri::command]
+async fn auth_prompt_respond(
+    auth_prompts: State<'_, Arc<AuthPrompts>>,
+    request_id: String,
+    answers: Vec<String>,
+) -> CmdResult<()> {
+    auth_prompts.respond(&request_id, answers);
     Ok(())
 }
 
@@ -537,6 +554,7 @@ async fn capture_output(
 async fn ssh_copy_id(
     app: AppHandle,
     prompts: State<'_, Arc<HostKeyPrompts>>,
+    auth_prompts: State<'_, Arc<AuthPrompts>>,
     host: String,
     port: u16,
     username: String,
@@ -546,6 +564,7 @@ async fn ssh_copy_id(
     ssh::copy_id(
         app,
         std::sync::Arc::clone(&prompts),
+        std::sync::Arc::clone(&auth_prompts),
         &host,
         port,
         &username,
@@ -725,6 +744,7 @@ pub fn run() {
         .setup(|app| {
             app.manage(Registry::default());
             app.manage(Arc::new(HostKeyPrompts::default()));
+            app.manage(Arc::new(AuthPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
 
             // Backfill credential→destination and AI-origin bindings for
@@ -760,6 +780,7 @@ pub fn run() {
             ssh_resize,
             ssh_disconnect,
             host_key_respond,
+            auth_prompt_respond,
             sftp_list,
             sftp_get,
             sftp_put,

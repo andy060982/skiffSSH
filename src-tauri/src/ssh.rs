@@ -210,6 +210,60 @@ impl HostKeyPrompts {
     }
 }
 
+/* ------------------------------------------- keyboard-interactive auth prompts */
+
+/// One field of a keyboard-interactive challenge shown to the user. Only ECHO
+/// (visible) prompts are ever sent to the UI — a hidden prompt is answered with
+/// the stored password entirely in the backend, so the password never crosses
+/// IPC (the "secrets never cross IPC outward" invariant).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthPromptField {
+    pub prompt: String,
+    pub echo: bool,
+}
+
+/// A keyboard-interactive challenge raised to the UI on `ssh://auth-prompt`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthPromptRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub name: String,
+    pub instruction: String,
+    pub prompts: Vec<AuthPromptField>,
+}
+
+/// Same oneshot bridge as `HostKeyPrompts`, but the answer is the list of typed
+/// responses — one per echo prompt shown. Resolved by `auth_prompt_respond`.
+#[derive(Default)]
+pub struct AuthPrompts {
+    pending: DashMap<String, oneshot::Sender<Vec<String>>>,
+}
+
+impl AuthPrompts {
+    /// Resolve a pending auth prompt with the user's typed answers.
+    pub fn respond(&self, request_id: &str, answers: Vec<String>) -> bool {
+        match self.pending.remove(request_id) {
+            Some((_, tx)) => tx.send(answers).is_ok(),
+            None => false,
+        }
+    }
+
+    fn register(&self, request_id: String) -> oneshot::Receiver<Vec<String>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(request_id, tx);
+        rx
+    }
+
+    fn cancel(&self, request_id: &str) {
+        self.pending.remove(request_id);
+    }
+}
+
+static AUTH_PROMPT_SEQ: AtomicU64 = AtomicU64::new(0);
+const AUTH_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Host key policy.
 ///
 /// russh's default handler rejects every key, and the tempting "fix" is to
@@ -474,6 +528,7 @@ impl Registry {
         &self,
         app: AppHandle,
         prompts: Arc<HostKeyPrompts>,
+        auth_prompts: Arc<AuthPrompts>,
         session_id: &str,
         host_id: &str,
         host: &str,
@@ -554,8 +609,11 @@ impl Registry {
                 };
                 let mut jh =
                     client::connect(jump_config, (j.host.as_str(), j.port), jump_handler).await?;
-                authenticate(&mut jh, &j.host_id, &j.username, &j.auth, j.key_path.as_deref(), None)
-                    .await?;
+                authenticate(
+                    &mut jh, &j.host_id, &j.username, &j.auth, j.key_path.as_deref(), None,
+                    &app, &auth_prompts, session_id,
+                )
+                .await?;
 
                 let tunnel = jh
                     .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
@@ -570,7 +628,11 @@ impl Registry {
             ),
         };
 
-        authenticate(&mut handle, host_id, username, auth, key_path, one_shot_password).await?;
+        authenticate(
+            &mut handle, host_id, username, auth, key_path, one_shot_password,
+            &app, &auth_prompts, session_id,
+        )
+        .await?;
 
         // Interactive shell on its own channel.
         let channel = handle.channel_open_session().await?;
@@ -1304,6 +1366,7 @@ fn authorize_stored_password(
 
 /// Shared between the target connection and a jump-host connection so the
 /// bastion supports the same three methods as any other host.
+#[allow(clippy::too_many_arguments)]
 async fn authenticate(
     handle: &mut Handle<ClientHandler>,
     host_id: &str,
@@ -1311,6 +1374,9 @@ async fn authenticate(
     auth: &str,
     key_path: Option<&str>,
     one_shot_password: Option<&str>,
+    app: &AppHandle,
+    auth_prompts: &Arc<AuthPrompts>,
+    session_id: &str,
 ) -> Result<(), SshError> {
     let authed = match auth {
         // Private key file. The Credential Manager entry for this host, if
@@ -1369,9 +1435,18 @@ async fn authenticate(
             if matches!(result, russh::client::AuthResult::Success) {
                 result
             } else {
-                keyboard_interactive_with_password(handle, username, pw.as_str()).await?
+                keyboard_interactive_with_password(
+                    handle,
+                    username,
+                    pw.as_str(),
+                    app,
+                    auth_prompts,
+                    session_id,
+                )
+                .await?
             }
-            // `pw` drops here — or at any `?` above — zeroizing its buffer.
+            // `pw` (Zeroizing) drops here — or at any `?` above — wiping its
+            // buffer on every exit path; no manual fill, no plain-String copy.
         }
     };
 
@@ -1381,18 +1456,20 @@ async fn authenticate(
     Ok(())
 }
 
-/// Keyboard-interactive auth, answering every hidden prompt with the
-/// password on hand.
+/// Keyboard-interactive auth.
 ///
-/// Covers the overwhelmingly common case (TACACS+/RADIUS asking one hidden
-/// "Password:" question). A prompt that ECHOES (an OTP or challenge code we
-/// could not possibly know) is answered with an empty string and will fail
-/// authentication — honestly — rather than hang the connect; interactive
-/// prompting through the UI is roadmap work.
+/// Hidden prompts (the common TACACS+/RADIUS single "Password:" question) are
+/// answered with the password on hand, in the backend — so the password never
+/// crosses IPC. A prompt that ECHOES (an OTP, token code, or security question
+/// the stored password cannot answer) is surfaced to the user through the UI
+/// via `request_auth_answers`, and their typed reply is interleaved back in.
 async fn keyboard_interactive_with_password(
     handle: &mut Handle<ClientHandler>,
     username: &str,
     password: &str,
+    app: &AppHandle,
+    auth_prompts: &Arc<AuthPrompts>,
+    session_id: &str,
 ) -> Result<russh::client::AuthResult, SshError> {
     use russh::client::KeyboardInteractiveAuthResponse as Kb;
 
@@ -1411,23 +1488,48 @@ async fn keyboard_interactive_with_password(
                     partial_success,
                 })
             }
-            Kb::InfoRequest { prompts, .. } => {
-                // Only a HIDDEN prompt gets the password; an echoed prompt (an
-                // OTP/challenge we can't know) gets an empty answer. `password`
-                // is borrowed from the caller's Zeroizing buffer, and we keep no
-                // copy of our own beyond the vector handed to russh below.
+            Kb::InfoRequest { name, instructions, prompts } => {
+                // An ECHO (visible) prompt is a live challenge the stored
+                // password can't answer — an OTP, a token code, a security
+                // question. Ask the user through the UI. Hidden prompts stay
+                // auto-answered with the password here in the backend, so the
+                // password itself never crosses IPC.
                 //
-                // Caveat, documented rather than hidden: russh 0.63's
-                // `..._respond` takes `Vec<String>` by value and moves it into
-                // its internal message queue, so that one transient plaintext
-                // copy lives inside russh for the round-trip and cannot be
-                // zeroized from here. Fully closing that needs upstream russh to
-                // accept a zeroizing response type; there is no additional copy
-                // on Skiff's side.
-                let answers: Vec<String> = prompts
-                    .iter()
-                    .map(|p| if p.echo { String::new() } else { password.to_string() })
-                    .collect();
+                // `password` is borrowed from the caller's Zeroizing buffer.
+                // Residual (documented, upstream-bounded): russh 0.63's
+                // `..._respond` takes the answers `Vec<String>` by value into its
+                // internal message queue, so that one transient plaintext copy
+                // lives inside russh for the round-trip and cannot be zeroized
+                // here — no additional copy is retained on Skiff's side.
+                let answers: Vec<String> = if prompts.iter().any(|p| p.echo) {
+                    let echo_fields: Vec<AuthPromptField> = prompts
+                        .iter()
+                        .filter(|p| p.echo)
+                        .map(|p| AuthPromptField { prompt: p.prompt.clone(), echo: true })
+                        .collect();
+                    let typed = request_auth_answers(
+                        app, auth_prompts, session_id, &name, &instructions, echo_fields,
+                    )
+                    .await?;
+                    // Interleave the user's typed answers (echo prompts, in order)
+                    // with the password (hidden prompts).
+                    let mut typed = typed.into_iter();
+                    prompts
+                        .iter()
+                        .map(|p| {
+                            if p.echo {
+                                typed.next().unwrap_or_default()
+                            } else {
+                                password.to_string()
+                            }
+                        })
+                        .collect()
+                } else {
+                    prompts
+                        .iter()
+                        .map(|p| if p.echo { String::new() } else { password.to_string() })
+                        .collect()
+                };
                 reply = handle
                     .authenticate_keyboard_interactive_respond(answers)
                     .await?;
@@ -1437,6 +1539,47 @@ async fn keyboard_interactive_with_password(
     Err(SshError::AuthFailed(format!(
         "{username}: keyboard-interactive did not converge after 5 rounds"
     )))
+}
+
+/// Raise a keyboard-interactive challenge to the UI and park on a oneshot until
+/// the user answers (or a timeout). Only the ECHO prompts are sent out; the
+/// returned vector is one typed answer per prompt shown, in order.
+async fn request_auth_answers(
+    app: &AppHandle,
+    auth_prompts: &Arc<AuthPrompts>,
+    session_id: &str,
+    name: &str,
+    instruction: &str,
+    fields: Vec<AuthPromptField>,
+) -> Result<Vec<String>, SshError> {
+    let request_id = format!(
+        "auth-{}-{}",
+        session_id,
+        AUTH_PROMPT_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let rx = auth_prompts.register(request_id.clone());
+
+    app.emit(
+        "ssh://auth-prompt",
+        AuthPromptRequest {
+            request_id: request_id.clone(),
+            session_id: session_id.to_string(),
+            name: name.to_string(),
+            instruction: instruction.to_string(),
+            prompts: fields,
+        },
+    )
+    .map_err(|_| SshError::AuthFailed("could not raise the interactive auth prompt".into()))?;
+
+    match tokio::time::timeout(AUTH_PROMPT_TIMEOUT, rx).await {
+        Ok(Ok(answers)) => Ok(answers),
+        // Sender dropped (dialog cancelled) — abort auth cleanly.
+        Ok(Err(_)) => Err(SshError::AuthFailed("interactive auth cancelled".into())),
+        Err(_) => {
+            auth_prompts.cancel(&request_id);
+            Err(SshError::AuthFailed("interactive auth prompt timed out".into()))
+        }
+    }
 }
 
 /// ssh-copy-id, in one call: connect with a password, append a public key to
@@ -1452,9 +1595,11 @@ async fn keyboard_interactive_with_password(
 /// config and are out of scope here — the UI offers the copyable command for
 /// those.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_id(
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
+    auth_prompts: Arc<AuthPrompts>,
     host: &str,
     port: u16,
     username: &str,
@@ -1486,14 +1631,18 @@ pub async fn copy_id(
         host: host.to_string(),
         ip,
         port,
-        app,
+        app: app.clone(),
         prompts,
     };
     let mut handle = client::connect(config, (host, port), handler).await?;
 
     // Password (with keyboard-interactive fallback), one-shot. host_id "" is
     // never consulted because the one-shot password is supplied.
-    authenticate(&mut handle, "", username, "password", None, Some(password)).await?;
+    authenticate(
+        &mut handle, "", username, "password", None, Some(password),
+        &app, &auth_prompts, "install-key",
+    )
+    .await?;
 
     // grep -qxF: only append if the exact line is not already present, so
     // running this twice does not duplicate the key. The append is BRACE-GROUPED
