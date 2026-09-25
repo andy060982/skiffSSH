@@ -106,6 +106,25 @@ pub struct TransferProgress {
     pub done: bool,
 }
 
+/// One file a recursive transfer could not move, pushed on `sftp://failure` so
+/// the UI can show the FULL list (not just the first failure) and offer a retry.
+/// Single-file transfers don't emit this — their error propagates as the row's
+/// own error, which is already the real reason.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferFailure {
+    pub session_id: String,
+    /// The transfer's ROOT source path (local for upload, remote for download) —
+    /// the value the queue row is keyed on, so the UI attributes this correctly.
+    pub root: String,
+    pub name: String,
+    /// Both sides, so the UI can rebuild a retry job for exactly this file.
+    pub local: String,
+    pub remote: String,
+    pub reason: String,
+    pub direction: &'static str,
+}
+
 /// Connection lifecycle, pushed to the frontend on `ssh://status`.
 ///
 /// Without this the UI has no way to learn a session died: the tab keeps its
@@ -792,21 +811,25 @@ impl Registry {
         while let Some((rdir, ldir)) = dirs.pop() {
             visited += 1;
             if visited > MAX_DIRS {
-                failed.push(format!(
+                let reason = format!(
                     "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
-                ));
+                );
+                emit_transfer_failure(app, session_id, remote, "(tree)", local, remote, reason.clone(), "download");
+                failed.push(reason);
                 break;
             }
             tokio::fs::create_dir_all(&ldir).await?;
             for entry in sftp.read_dir(&rdir).await? {
                 let name = entry.file_name();
+                let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
                 // The server chose this name; refuse anything that is not a
                 // plain component before it becomes a local path.
                 if !safe_local_component(&name) {
-                    failed.push(format!("{name} (unsafe name, skipped)"));
+                    let reason = format!("{name} (unsafe name, skipped)");
+                    emit_transfer_failure(app, session_id, remote, &name, "", &rpath, reason.clone(), "download");
+                    failed.push(reason);
                     continue;
                 }
-                let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
                 let lpath = std::path::Path::new(&ldir)
                     .join(&name)
                     .to_string_lossy()
@@ -819,13 +842,18 @@ impl Registry {
                     // open() on a dir-symlink fails, and following file links
                     // can duplicate or even loop. Recorded so the user learns
                     // it was left behind rather than silently missing it.
-                    failed.push(format!("{rpath} (symlink, skipped)"));
+                    let reason = format!("{rpath} (symlink, skipped)");
+                    emit_transfer_failure(app, session_id, remote, &name, &lpath, &rpath, "symlink, skipped".into(), "download");
+                    failed.push(reason);
                 } else {
                     // One unreadable file must not abort the other 499: keep
                     // walking, collect what failed, report the tally at the end.
                     match copy_remote_file(&sftp, app, session_id, &rpath, &lpath).await {
                         Ok(n) => total += n,
-                        Err(e) => failed.push(format!("{rpath}: {e}")),
+                        Err(e) => {
+                            emit_transfer_failure(app, session_id, remote, &name, &lpath, &rpath, format!("{e}"), "download");
+                            failed.push(format!("{rpath}: {e}"));
+                        }
                     }
                 }
             }
@@ -869,9 +897,11 @@ impl Registry {
         while let Some((ldir, rdir)) = dirs.pop() {
             visited += 1;
             if visited > MAX_DIRS {
-                failed.push(format!(
+                let reason = format!(
                     "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
-                ));
+                );
+                emit_transfer_failure(app, session_id, local, "(tree)", local, remote, reason.clone(), "upload");
+                failed.push(reason);
                 break;
             }
             // create_dir on an existing directory is an error over SFTP; ignore
@@ -886,11 +916,15 @@ impl Registry {
                 if ft.is_dir() {
                     dirs.push((lpath, rpath));
                 } else if ft.is_symlink() {
+                    emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, "symlink, skipped".into(), "upload");
                     failed.push(format!("{lpath} (symlink, skipped)"));
                 } else {
                     match copy_local_file(&sftp, app, session_id, &lpath, &rpath).await {
                         Ok(n) => total += n,
-                        Err(e) => failed.push(format!("{lpath}: {e}")),
+                        Err(e) => {
+                            emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, format!("{e}"), "upload");
+                            failed.push(format!("{lpath}: {e}"));
+                        }
                     }
                 }
             }
@@ -1440,6 +1474,33 @@ fn is_windows_reserved(name: &str) -> bool {
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
+}
+
+/// Push one per-file failure to the UI so a recursive transfer can report the
+/// full list and offer a retry. Best-effort — a dropped event only costs detail.
+#[allow(clippy::too_many_arguments)]
+fn emit_transfer_failure(
+    app: &AppHandle,
+    session_id: &str,
+    root: &str,
+    name: &str,
+    local: &str,
+    remote: &str,
+    reason: String,
+    direction: &'static str,
+) {
+    let _ = app.emit(
+        "sftp://failure",
+        TransferFailure {
+            session_id: session_id.to_string(),
+            root: root.to_string(),
+            name: name.to_string(),
+            local: local.to_string(),
+            remote: remote.to_string(),
+            reason,
+            direction,
+        },
+    );
 }
 
 /// Copy one remote file to a local path, streaming with progress.

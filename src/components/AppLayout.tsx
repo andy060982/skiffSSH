@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Host, HostNode, Session, Transfer, TransferProgressEvent, WorkspaceView } from '../types'
+import type { Host, HostNode, Session, Transfer, TransferProgressEvent, TransferFailureEvent, WorkspaceView } from '../types'
 import {
   addFolder, allFolders, allHosts, countHosts, findHost, moveHost, reidentify,
   effectiveHostColor, removeFolder, removeHost, renameFolder, setFolderColor, upsertHost,
@@ -225,23 +225,44 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
      row ids. Mounted once here, so it keeps updating even while SftpView is
      unmounted in terminal view. */
   useEffect(() => {
-    let un: (() => void) | null = null
+    const uns: (() => void)[] = []
     let dead = false
-    void safeListen<TransferProgressEvent>('sftp://progress', (p) => {
-      setTransfers((list) =>
-        list.map((t) =>
-          t.sessionId === p.sessionId && t.path === p.filePath && t.status === 'active'
-            ? { ...t, bytesDone: p.bytesTransferred, bytesTotal: p.totalBytes }
-            : t,
-        ),
-      )
-    }).then((fn) => {
-      if (dead) fn()
-      else un = fn
-    })
+    const add = (p: Promise<() => void>) =>
+      void p.then((fn) => (dead ? fn() : uns.push(fn)))
+
+    add(
+      safeListen<TransferProgressEvent>('sftp://progress', (p) => {
+        setTransfers((list) =>
+          list.map((t) =>
+            t.sessionId === p.sessionId && t.path === p.filePath && t.status === 'active'
+              ? { ...t, bytesDone: p.bytesTransferred, bytesTotal: p.totalBytes }
+              : t,
+          ),
+        )
+      }),
+    )
+    // Accumulate per-file failures onto the active folder transfer they belong
+    // to (matched by the transfer's source path == the failure's root).
+    add(
+      safeListen<TransferFailureEvent>('sftp://failure', (f) => {
+        setTransfers((list) =>
+          list.map((t) =>
+            t.sessionId === f.sessionId && t.path === f.root && t.status === 'active'
+              ? {
+                  ...t,
+                  failures: [
+                    ...(t.failures ?? []),
+                    { name: f.name, local: f.local, remote: f.remote, reason: f.reason },
+                  ],
+                }
+              : t,
+          ),
+        )
+      }),
+    )
     return () => {
       dead = true
-      un?.()
+      uns.forEach((fn) => fn())
     }
   }, [])
 
@@ -300,6 +321,20 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const clearTransfers = useCallback(
     () => setTransfers((t) => t.filter((x) => x.status === 'active')),
     [],
+  )
+
+  /** Re-run only the files that failed in a folder transfer. Drops the old
+   *  errored row and starts a fresh transfer for the retryable failures (those
+   *  with both paths — items skipped by name are not retryable). */
+  const retryFailed = useCallback(
+    (t: Transfer) => {
+      const jobs = (t.failures ?? [])
+        .filter((f) => f.local && f.remote)
+        .map((f) => ({ name: f.name, local: f.local, remote: f.remote }))
+      setTransfers((list) => list.filter((x) => x.id !== t.id))
+      if (jobs.length > 0) void startTransfer(t.sessionId, t.direction, jobs)
+    },
+    [startTransfer],
   )
 
   /* ---------------------------------------------------------------- actions */
@@ -1159,7 +1194,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
         )}
       </div>
 
-      <TransferBar transfers={transfers} onClear={clearTransfers} />
+      <TransferBar transfers={transfers} onClear={clearTransfers} onRetry={retryFailed} />
 
       <StatusBar
         session={active}
