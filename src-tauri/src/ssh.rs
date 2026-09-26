@@ -1655,13 +1655,28 @@ async fn copy_local_file(
     match copy_result {
         Ok(done) => {
             // Atomic replace. SSH_FXP_RENAME does not universally replace an
-            // existing target, so if the direct rename fails, remove the
-            // destination and retry — mirroring the local-side fallback.
+            // existing target, so if the direct rename fails, move the existing
+            // file ASIDE to a backup (never delete it) before putting the new
+            // one in place — so a second failure or a dropped connection cannot
+            // destroy the original with nothing to recover.
             if sftp.rename(tmp.clone(), remote.to_string()).await.is_err() {
-                let _ = sftp.remove_file(remote.to_string()).await;
-                if let Err(e) = sftp.rename(tmp.clone(), remote.to_string()).await {
-                    let _ = sftp.remove_file(tmp).await;
-                    return Err(e.into());
+                let bak = format!("{tmp}.bak");
+                let _ = sftp.remove_file(bak.clone()).await; // clear any stale backup
+                let moved = sftp.rename(remote.to_string(), bak.clone()).await.is_ok();
+                match sftp.rename(tmp.clone(), remote.to_string()).await {
+                    Ok(()) => {
+                        if moved {
+                            let _ = sftp.remove_file(bak).await;
+                        }
+                    }
+                    Err(e) => {
+                        // Restore the original rather than leave nothing behind.
+                        if moved {
+                            let _ = sftp.rename(bak, remote.to_string()).await;
+                        }
+                        let _ = sftp.remove_file(tmp).await;
+                        return Err(e.into());
+                    }
                 }
             }
             Ok(done)
