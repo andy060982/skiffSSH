@@ -1736,6 +1736,13 @@ async fn copy_remote_file(
     }
     .await;
 
+    // Close the remote read handle explicitly. Dropping the SFTP `File` does NOT
+    // send SSH_FXP_CLOSE, so a recursive download of a large tree would leak one
+    // server-side handle per file and eventually exhaust the server's limit —
+    // the download-side twin of the upload handle leak. Best-effort: a close
+    // failure must not fail an otherwise-complete transfer.
+    let _ = src.close().await;
+
     match copy_result {
         Ok(done) => {
             // Atomic replace. std::fs::rename replaces an existing file on both
