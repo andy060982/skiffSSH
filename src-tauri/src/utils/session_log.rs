@@ -434,12 +434,38 @@ pub fn list() -> Result<Vec<LogEntry>, KnownHostsError> {
 }
 
 /// Read one transcript by name. Rejects anything that is not a bare filename,
-/// so a crafted name cannot escape the logs directory.
+/// so a crafted name cannot escape the logs directory or read through a link.
 pub fn read_log(name: &str) -> Result<String, KnownHostsError> {
-    if name.contains('/') || name.contains('\\') || name.contains("..") || !name.ends_with(".log") {
+    // Accept only a single *normal* path component ending in .log. Parsing the
+    // name (rather than ad-hoc substring checks) rejects separators, absolute
+    // paths, Windows prefixes, "." and ".." in one shot. The explicit ':' check
+    // additionally blocks Windows drive-relative ("C:foo") and NTFS
+    // alternate-data-stream ("foo.log:evil") syntax — a colon is not a path
+    // separator, so the component parser alone would let those through.
+    let single_normal = {
+        let mut comps = std::path::Path::new(name).components();
+        matches!(
+            (comps.next(), comps.next()),
+            (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)
+        )
+    };
+    if !single_normal || name.contains(':') || name.contains('\0') || !name.ends_with(".log") {
         return Err(KnownHostsError::Parse(format!("invalid log name: {name}")));
     }
+
     let path = logs_dir()?.join(name);
+
+    // Never read THROUGH a symlink: a link planted at logs_dir/<name> could
+    // redirect the read to any file the process can see. A transcript is always
+    // a regular file this app wrote, so refuse a symlink outright.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return Err(KnownHostsError::Parse(format!(
+                "refusing to read a symlinked log: {name}"
+            )));
+        }
+    }
+
     std::fs::read_to_string(&path).map_err(|source| KnownHostsError::Io { path, source })
 }
 
