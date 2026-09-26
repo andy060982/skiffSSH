@@ -343,27 +343,28 @@ struct Forward {
     tunnels: TunnelHandles,
 }
 
-/// Abort handles for the live per-connection tunnel tasks under one forward.
-/// A plain `std::sync::Mutex` (never held across an `.await`) is enough — pushes
-/// happen in the accept loop, and the whole set is aborted on teardown.
-type TunnelHandles = Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>;
+/// Join handles for the live per-connection tunnel tasks under one forward.
+/// `JoinHandle` rather than `AbortHandle` so teardown can *await* completion,
+/// not just request cancellation. A plain `std::sync::Mutex` (never held across
+/// an `.await`) is enough — pushes happen in the accept loop, and the whole set
+/// is drained on teardown.
+type TunnelHandles = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
 
 /// Record a newly spawned tunnel task, pruning handles for tunnels that have
 /// already finished so a long-lived forward's set does not grow without bound.
-fn track_tunnel(tunnels: &TunnelHandles, handle: tokio::task::AbortHandle) {
+fn track_tunnel(tunnels: &TunnelHandles, handle: tokio::task::JoinHandle<()>) {
     if let Ok(mut v) = tunnels.lock() {
-        v.retain(|a| !a.is_finished());
+        v.retain(|h| !h.is_finished());
         v.push(handle);
     }
 }
 
-/// Abort every live tunnel under a forward. Aborting an already-finished task is
-/// a harmless no-op, so this is safe to call regardless of tunnel state.
-fn abort_tunnels(tunnels: &TunnelHandles) {
-    if let Ok(v) = tunnels.lock() {
-        for a in v.iter() {
-            a.abort();
-        }
+/// Remove and return all currently-tracked tunnel handles, so the caller can
+/// abort (and optionally await) them without holding the lock across `.await`.
+fn take_tunnels(tunnels: &TunnelHandles) -> Vec<tokio::task::JoinHandle<()>> {
+    match tunnels.lock() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -425,11 +426,14 @@ impl Registry {
             .collect();
         for fid in doomed {
             if let Some((_, fw)) = self.forwards.remove(&fid) {
-                // Abort live tunnels first, then the listener, then await the
-                // listener so teardown is complete before we return. (The
-                // disconnect above already breaks each tunnel's channel; this
-                // guarantees the tasks are cancelled rather than left to notice.)
-                abort_tunnels(&fw.tunnels);
+                // Abort AND await every live tunnel, then the listener, so
+                // "disconnected" means the per-connection tunnel tasks have
+                // actually unwound and dropped their channels — not merely that
+                // cancellation was requested.
+                for h in take_tunnels(&fw.tunnels) {
+                    h.abort();
+                    let _ = h.await;
+                }
                 fw.listener.abort();
                 let _ = fw.listener.await;
             }
@@ -1039,7 +1043,7 @@ impl Registry {
                     let mut stream = channel.into_stream();
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
                 });
-                track_tunnel(&tunnels_loop, h.abort_handle());
+                track_tunnel(&tunnels_loop, h);
             }
         });
 
@@ -1058,7 +1062,9 @@ impl Registry {
     /// keeps flowing after the user stops it — not just the listener.
     pub fn forward_stop(&self, forward_id: &str) {
         if let Some((_, fw)) = self.forwards.remove(forward_id) {
-            abort_tunnels(&fw.tunnels);
+            for h in take_tunnels(&fw.tunnels) {
+                h.abort();
+            }
             fw.listener.abort();
         }
     }
@@ -1104,7 +1110,7 @@ impl Registry {
                 let h = tokio::spawn(async move {
                     let _ = socks5_serve(sess, tcp, peer).await;
                 });
-                track_tunnel(&tunnels_loop, h.abort_handle());
+                track_tunnel(&tunnels_loop, h);
             }
         });
 
