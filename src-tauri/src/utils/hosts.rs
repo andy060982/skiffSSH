@@ -30,10 +30,12 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// A unique temp sibling is written in full, then rename-replaced over the
 /// destination. `std::fs::rename` is an atomic replace on Unix and on modern
-/// Windows; only if that fails do we fall back to remove-then-rename, and the
-/// unique temp (never the shared one the old code used) is still intact on disk
-/// if we crash in that narrow window. The whole operation is serialised
-/// process-wide, so concurrent saves cannot lose data or clobber each other.
+/// Windows. Only if that direct replace fails do we take the fallback — and the
+/// fallback never *deletes* the original: it moves it aside to a backup first,
+/// so at no instant is the destination gone, and if the second rename fails the
+/// original is restored. A crash in the tiny window leaves either the new file
+/// in place or the original recoverable at its `.bak` sibling — never nothing.
+/// The whole operation is serialised process-wide.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), KnownHostsError> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -45,20 +47,37 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), KnownHostsError> {
     })?;
 
     if std::fs::rename(&tmp, path).is_err() {
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|source| KnownHostsError::Io {
-                path: path.to_path_buf(),
-                source,
+        // Move the original ASIDE (not delete) before putting the new file in
+        // place, so a crash between the two renames cannot lose the catalogue.
+        let bak = path.with_extension(format!("bak.{}.{}", std::process::id(), n));
+        let had_original = path.exists();
+        if had_original {
+            std::fs::rename(path, &bak).map_err(|source| {
+                let _ = std::fs::remove_file(&tmp);
+                KnownHostsError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                }
             })?;
         }
-        std::fs::rename(&tmp, path).map_err(|source| {
-            // Do not leave the scratch file behind if the replace truly failed.
-            let _ = std::fs::remove_file(&tmp);
-            KnownHostsError::Io {
-                path: path.to_path_buf(),
-                source,
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => {
+                if had_original {
+                    let _ = std::fs::remove_file(&bak);
+                }
             }
-        })?;
+            Err(source) => {
+                // Put the original back rather than leave the destination empty.
+                if had_original {
+                    let _ = std::fs::rename(&bak, path);
+                }
+                let _ = std::fs::remove_file(&tmp);
+                return Err(KnownHostsError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
     }
     Ok(())
 }
