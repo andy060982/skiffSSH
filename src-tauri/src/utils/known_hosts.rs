@@ -145,7 +145,7 @@ fn classify(
 ) -> Result<HostKeyStatus, KnownHostsError> {
     // Revocation wins over everything: an explicitly `@revoked` key is refused
     // even if the same key also appears as a normal trust entry.
-    if let Some(line) = revoked_line(host, port, key, path)? {
+    if let Some(line) = revoked_line(key, path)? {
         return Ok(HostKeyStatus::Revoked { line });
     }
 
@@ -178,20 +178,23 @@ fn classify(
     }
 }
 
-/// The 1-based line of a `@revoked` entry naming this host whose key matches the
-/// presented one, if any. Read/parse failure of the store propagates (fail
-/// closed); an unparseable individual `@revoked` line is skipped, not fatal.
-fn revoked_line(
-    host: &str,
-    port: u16,
-    key: &PublicKey,
-    path: &Path,
-) -> Result<Option<usize>, KnownHostsError> {
-    let needle = if port == 22 {
-        host.to_string()
-    } else {
-        format!("[{host}]:{port}")
-    };
+/// The 1-based line of a `@revoked` entry whose key matches the presented one,
+/// if any.
+///
+/// Matching is by KEY MATERIAL, not by host pattern. A `@revoked` line's host
+/// field can be a literal name, `[host]:port`, a comma list, a `*`/`?` wildcard,
+/// a negation, or an HMAC-hashed `|1|…` entry — and getting that matching subtly
+/// wrong is exactly how a revoked key slips back through to a trust prompt.
+/// Comparing key bytes instead is simpler and strictly safer: if the exact key
+/// the server just presented is marked `@revoked` anywhere in the store, refuse
+/// it. This is a deliberate conservative over-approximation (a key revoked for
+/// one host is treated as revoked everywhere) — the right instinct for what is,
+/// by definition, a key someone marked as compromised.
+///
+/// A store read failure propagates (fail closed). A `@revoked` line whose key
+/// field is unparseable cannot match any real key and is skipped — it could not
+/// have revoked a specific key by content in the first place.
+fn revoked_line(key: &PublicKey, path: &Path) -> Result<Option<usize>, KnownHostsError> {
     let text = std::fs::read_to_string(path).map_err(|source| KnownHostsError::Io {
         path: path.to_path_buf(),
         source,
@@ -205,17 +208,16 @@ fn revoked_line(
         if !matches!(fields.next(), Some(m) if m.eq_ignore_ascii_case("@revoked")) {
             continue;
         }
-        let Some(host_field) = fields.next() else { continue };
-        if !host_field.split(',').any(|h| h.eq_ignore_ascii_case(&needle)) {
-            continue;
-        }
-        let (Some(key_type), Some(b64)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        // Reassemble the "type base64" openssh form and compare key material.
-        if let Ok(revoked) = PublicKey::from_openssh(&format!("{key_type} {b64}")) {
-            if revoked.key_data() == key.key_data() {
-                return Ok(Some(i + 1));
+        // Everything after the marker is `<hostpattern> <keytype> <base64>
+        // [comment]`. Rather than interpret the host pattern, scan the remaining
+        // fields for any adjacent `<type> <base64>` pair that parses to a key,
+        // and compare its material — robust to the host field's form.
+        let rest: Vec<&str> = fields.collect();
+        for pair in rest.windows(2) {
+            if let Ok(revoked) = PublicKey::from_openssh(&format!("{} {}", pair[0], pair[1])) {
+                if revoked.key_data() == key.key_data() {
+                    return Ok(Some(i + 1));
+                }
             }
         }
     }
@@ -314,5 +316,41 @@ mod tests {
         let b = ensure_store().expect("second call");
         assert_eq!(a, b);
         assert!(a.exists());
+    }
+
+    // Revocation must be caught regardless of the @revoked line's host-pattern
+    // form (wildcard, hashed, comma list), because it is matched by KEY, not
+    // host. A different key on the same lines must NOT be reported revoked.
+    #[test]
+    fn revoked_matches_by_key_across_host_pattern_forms() {
+        const KEY1: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1EeRn1nUZ6oQiaSmrlPONbjg1FxJtr35MXzTndFYIe revtest";
+        const KEY2: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHveLo5tgiTjyNgc98zwmigaaw1vJ/1IN9KDWqa0Z43a other";
+        let k1 = PublicKey::from_openssh(KEY1).expect("k1 parses");
+        let k2 = PublicKey::from_openssh(KEY2).expect("k2 parses");
+        let k1_body = KEY1.trim_start_matches("ssh-ed25519 ").trim_end_matches(" revtest");
+
+        let dir = std::env::temp_dir().join(format!("skiff-revtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        // A wildcard-host @revoked line and a hashed-host one, both for KEY1.
+        std::fs::write(
+            &path,
+            format!(
+                "# comment\n\
+                 host.example ssh-ed25519 {k1_body}\n\
+                 @revoked *.wild ssh-ed25519 {k1_body}\n\
+                 @revoked |1|c2FsdA==|aGFzaA== ssh-ed25519 {k1_body}\n",
+            ),
+        )
+        .unwrap();
+
+        // KEY1 is revoked (matched despite wildcard/hashed host fields).
+        assert!(revoked_line(&k1, &path).unwrap().is_some());
+        // KEY2 is not on any @revoked line → not revoked.
+        assert!(revoked_line(&k2, &path).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
