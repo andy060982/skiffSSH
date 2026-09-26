@@ -9,7 +9,8 @@
 //!    secret happens entirely in Rust. Anything returned to the webview is
 //!    reachable from devtools and from any XSS in the UI.
 //! 2. **Secrets are zeroized.** Reads return a `Zeroizing<String>` that wipes on
-//!    drop; the Windows path additionally wipes its UTF-16 staging buffers.
+//!    drop; the Windows path additionally wipes its UTF-16 staging buffers and
+//!    the credential blob returned by `CredReadW` before it is freed.
 //! 3. **Every raw resource is released.** The Windows `CredReadW` allocation is
 //!    freed on every path, including errors.
 
@@ -108,6 +109,19 @@ mod imp {
                 decoded
             }
         };
+
+        // Wipe the vault's plaintext copy in our own address space before
+        // releasing it: CredFree returns the buffer to the heap without
+        // scrubbing it, leaving the decrypted secret readable in freed memory.
+        // SAFETY: ptr is a live CredReadW allocation; CredentialBlob/Size
+        // describe a buffer we own until CredFree, so zeroing it is in-bounds.
+        unsafe {
+            let cred = &*ptr;
+            let len = cred.CredentialBlobSize as usize;
+            if !cred.CredentialBlob.is_null() && len > 0 {
+                std::slice::from_raw_parts_mut(cred.CredentialBlob, len).zeroize();
+            }
+        }
 
         // SAFETY: ptr came from a successful CredReadW and is freed exactly once.
         unsafe { CredFree(ptr as *mut c_void) };

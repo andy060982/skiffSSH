@@ -1273,20 +1273,24 @@ async fn authenticate(
         // single hidden "Password:" question. Users should not need to know
         // which of the two dances their firewall does.
         _ => {
-            let pw: String = match one_shot_password {
-                Some(p) => p.to_string(),
-                None => credentials::read_secret(host_id)?.as_str().to_string(),
+            // Hold the working copy in Zeroizing so it is wiped on EVERY exit
+            // path: the old code copied the secret into a plain String and only
+            // wiped it after both awaits succeeded, so a failed `?` between them
+            // (or a cancellation) left the plaintext in the heap. read_secret
+            // already returns Zeroizing; a one-shot password is wrapped to match.
+            // The previous `unsafe { as_mut_vec().fill(0) }` is gone — fill(0) is
+            // not a guaranteed zeroization primitive, and Zeroizing::drop is.
+            let pw: zeroize::Zeroizing<String> = match one_shot_password {
+                Some(p) => zeroize::Zeroizing::new(p.to_string()),
+                None => credentials::read_secret(host_id)?,
             };
             let result = handle.authenticate_password(username, pw.as_str()).await?;
-            let result = if matches!(result, russh::client::AuthResult::Success) {
+            if matches!(result, russh::client::AuthResult::Success) {
                 result
             } else {
-                keyboard_interactive_with_password(handle, username, &pw).await?
-            };
-            // Best-effort wipe of the working copy.
-            let mut pw = pw;
-            unsafe { pw.as_mut_vec().fill(0) };
-            result
+                keyboard_interactive_with_password(handle, username, pw.as_str()).await?
+            }
+            // `pw` drops here — or at any `?` above — zeroizing its buffer.
         }
     };
 
@@ -1327,6 +1331,18 @@ async fn keyboard_interactive_with_password(
                 })
             }
             Kb::InfoRequest { prompts, .. } => {
+                // Only a HIDDEN prompt gets the password; an echoed prompt (an
+                // OTP/challenge we can't know) gets an empty answer. `password`
+                // is borrowed from the caller's Zeroizing buffer, and we keep no
+                // copy of our own beyond the vector handed to russh below.
+                //
+                // Caveat, documented rather than hidden: russh 0.63's
+                // `..._respond` takes `Vec<String>` by value and moves it into
+                // its internal message queue, so that one transient plaintext
+                // copy lives inside russh for the round-trip and cannot be
+                // zeroized from here. Fully closing that needs upstream russh to
+                // accept a zeroizing response type; there is no additional copy
+                // on Skiff's side.
                 let answers: Vec<String> = prompts
                     .iter()
                     .map(|p| if p.echo { String::new() } else { password.to_string() })
