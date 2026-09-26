@@ -14,6 +14,8 @@ interface Props {
   onOpenHistory: () => void
   onHostMenu: (host: Host, x: number, y: number) => void
   onFolderMenu: (folderId: string, name: string, x: number, y: number) => void
+  /** Right-click on the sidebar's empty area (not on a host/folder row). */
+  onSidebarMenu: (x: number, y: number) => void
   onProbe: () => void
   probing: boolean
   reachability: Record<string, { ok: boolean; ms?: number }>
@@ -23,7 +25,7 @@ interface Props {
 
 export function HostSidebar({
   hosts, width, onOpenHost, onSelectHost, onAddHost, onEditHost, onOpenHistory,
-  onHostMenu, onFolderMenu, onProbe, probing, reachability, openHostIds, activeHostId,
+  onHostMenu, onFolderMenu, onSidebarMenu, onProbe, probing, reachability, openHostIds, activeHostId,
 }: Props) {
   const [query, setQuery] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
@@ -120,7 +122,17 @@ export function HostSidebar({
 
       {/* min-h-0 is load-bearing: without it this flex child refuses to shrink
           and the tree scrolls the whole window instead of itself. */}
-      <nav role="tree" aria-label="Saved hosts" className="min-h-0 flex-1 overflow-y-auto pb-2">
+      <nav
+        role="tree"
+        aria-label="Saved hosts"
+        className="min-h-0 flex-1 overflow-y-auto pb-2"
+        onContextMenu={(e) => {
+          // Only the empty area: a right-click on a host/folder row stops
+          // propagation in HostTree, so this fires for the background alone.
+          e.preventDefault()
+          onSidebarMenu(e.clientX, e.clientY)
+        }}
+      >
         {tree.length === 0 ? (
           <p className="px-3 py-6 text-center text-[12px] text-ink-faint">
             No hosts match “{query}”.

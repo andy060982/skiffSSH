@@ -920,6 +920,22 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     setMenu({ x, y, items })
   }, [activeId, closeSession, persistHosts])
 
+  /** Right-click on the host sidebar's empty area: the fast path to a new
+   *  connection without hunting for the "+" button. */
+  const openSidebarMenu = useCallback((x: number, y: number) => {
+    const items: MenuItem[] = [
+      { label: 'New Connection…', onSelect: () => setEditing({ host: null }) },
+      {
+        label: 'New Folder…',
+        onSelect: () => {
+          const name = window.prompt('Folder name')
+          if (name?.trim()) persistHosts(addFolder(hostsRef.current, name.trim()))
+        },
+      },
+    ]
+    setMenu({ x, y, items })
+  }, [persistHosts])
+
   /** Move a pane out of its group and into a tab of its own. */
   const separateSession = useCallback((sessionId: string) => {
     setSessions((prev) =>
@@ -1124,6 +1140,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
           onOpenHistory={() => setShowHistory(true)}
           onHostMenu={openHostMenu}
           onFolderMenu={openFolderMenu}
+          onSidebarMenu={openSidebarMenu}
           onProbe={() => void probeAll()}
           probing={probing}
           reachability={reachability}
