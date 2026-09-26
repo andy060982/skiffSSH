@@ -88,6 +88,19 @@ async fn auth_prompt_respond(
     Ok(())
 }
 
+/// Cancel an interactive auth prompt: aborts authentication entirely rather than
+/// answering. This is what the dialog's Cancel/Escape must call — responding
+/// with an empty answer vector would still let the backend fill the HIDDEN
+/// prompts with the stored password, i.e. authenticate despite "Cancel".
+#[tauri::command]
+async fn auth_prompt_cancel(
+    auth_prompts: State<'_, Arc<AuthPrompts>>,
+    request_id: String,
+) -> CmdResult<()> {
+    auth_prompts.cancel(&request_id);
+    Ok(())
+}
+
 /// Keystrokes from the terminal grid.
 ///
 /// `data` is already-encoded terminal input, not a key name: arrow keys arrive
@@ -781,6 +794,7 @@ pub fn run() {
             ssh_disconnect,
             host_key_respond,
             auth_prompt_respond,
+            auth_prompt_cancel,
             sftp_list,
             sftp_get,
             sftp_put,

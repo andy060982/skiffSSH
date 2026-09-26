@@ -70,7 +70,7 @@ export function AuthPromptDialog() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
-        void submit([]) // empty answers -> the auth attempt fails and the connection aborts
+        void cancel()
       }
     }
     window.addEventListener('keydown', onKey, true)
@@ -85,6 +85,16 @@ export function AuthPromptDialog() {
     setBusy(true)
     await safeInvoke('auth_prompt_respond', { requestId: request.requestId, answers: vals })
     // Drop THIS prompt (by id) so the next queued challenge shows.
+    setQueue((q) => q.filter((r) => r.requestId !== request.requestId))
+  }
+
+  // Cancel must ABORT auth, not answer: an empty response would still let the
+  // backend fill hidden prompts with the stored password (i.e. authenticate).
+  // auth_prompt_cancel drops the backend oneshot so authentication fails.
+  async function cancel() {
+    if (!request) return
+    setBusy(true)
+    await safeInvoke('auth_prompt_cancel', { requestId: request.requestId })
     setQueue((q) => q.filter((r) => r.requestId !== request.requestId))
   }
 
@@ -154,7 +164,7 @@ export function AuthPromptDialog() {
           <button
             type="button"
             disabled={busy}
-            onClick={() => void submit([])}
+            onClick={() => void cancel()}
             className="flex items-center gap-1.5 rounded border border-line bg-surface-2 px-3 py-1.5 text-[12.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink disabled:opacity-50"
           >
             <X size={13} aria-hidden />

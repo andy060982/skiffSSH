@@ -256,7 +256,12 @@ impl AuthPrompts {
         rx
     }
 
-    fn cancel(&self, request_id: &str) {
+    /// Drop the pending sender for a request. The waiting `request_auth_answers`
+    /// then sees its receiver error and returns `AuthFailed("cancelled")`, which
+    /// aborts the whole authentication — so NO answer (and therefore no stored
+    /// password for the hidden prompts) is ever sent. This is what "Cancel" must
+    /// do; answering with an empty vector would still send the password.
+    pub fn cancel(&self, request_id: &str) {
         self.pending.remove(request_id);
     }
 }
