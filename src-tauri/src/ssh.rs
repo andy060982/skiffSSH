@@ -237,13 +237,18 @@ impl client::Handler for ClientHandler {
         //   Unknown -> ask a human
         match known_hosts::check(&self.host, self.port, server_public_key) {
             Ok(HostKeyStatus::Trusted) => return Ok(true),
-            Ok(HostKeyStatus::Changed { line }) => {
+            Ok(HostKeyStatus::Changed { line }) | Ok(HostKeyStatus::Revoked { line }) => {
+                // Both refuse outright and never prompt: a different key for a
+                // known host, or one explicitly revoked, is exactly the case a
+                // trust dialog must never appear for.
                 return Err(SshError::ChangedHostKey {
                     host: self.host.clone(),
                     line,
                 })
             }
             Ok(HostKeyStatus::Unknown) => { /* fall through and ask */ }
+            // A read/parse failure of the store fails CLOSED (refuse), rather
+            // than routing to a first-use trust prompt.
             Err(e) => return Err(SshError::KnownHosts(e)),
         }
 
