@@ -1559,17 +1559,26 @@ async fn request_auth_answers(
     );
     let rx = auth_prompts.register(request_id.clone());
 
-    app.emit(
-        "ssh://auth-prompt",
-        AuthPromptRequest {
-            request_id: request_id.clone(),
-            session_id: session_id.to_string(),
-            name: name.to_string(),
-            instruction: instruction.to_string(),
-            prompts: fields,
-        },
-    )
-    .map_err(|_| SshError::AuthFailed("could not raise the interactive auth prompt".into()))?;
+    if app
+        .emit(
+            "ssh://auth-prompt",
+            AuthPromptRequest {
+                request_id: request_id.clone(),
+                session_id: session_id.to_string(),
+                name: name.to_string(),
+                instruction: instruction.to_string(),
+                prompts: fields,
+            },
+        )
+        .is_err()
+    {
+        // The dialog will never be shown, so nothing will ever resolve this
+        // request — drop the pending entry instead of leaking it until timeout.
+        auth_prompts.cancel(&request_id);
+        return Err(SshError::AuthFailed(
+            "could not raise the interactive auth prompt".into(),
+        ));
+    }
 
     match tokio::time::timeout(AUTH_PROMPT_TIMEOUT, rx).await {
         Ok(Ok(answers)) => Ok(answers),

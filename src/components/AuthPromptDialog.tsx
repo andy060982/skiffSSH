@@ -31,19 +31,24 @@ interface AuthPromptRequest {
    whole connection) — an unattended dialog must not silently accept anything.
 --------------------------------------------------------------------------- */
 export function AuthPromptDialog() {
-  const [request, setRequest] = useState<AuthPromptRequest | null>(null)
+  // A QUEUE, not a single slot: two sessions can hit a keyboard-interactive
+  // challenge at once, each parked on its own backend oneshot. Overwriting the
+  // visible request would strand the earlier one until its 120s timeout (same
+  // bug HostKeyDialog avoids). Show the head; reveal the next after answering.
+  const [queue, setQueue] = useState<AuthPromptRequest[]>([])
   const [answers, setAnswers] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const firstRef = useRef<HTMLInputElement>(null)
+
+  const request = queue[0] ?? null
 
   useEffect(() => {
     let un: (() => void) | null = null
     let dead = false
 
     void safeListen<AuthPromptRequest>('ssh://auth-prompt', (payload) => {
-      setRequest(payload)
-      setAnswers(payload.prompts.map(() => ''))
-      setBusy(false)
+      // Append, de-duping by requestId so a re-emit can't enqueue twice.
+      setQueue((q) => (q.some((r) => r.requestId === payload.requestId) ? q : [...q, payload]))
     }).then((fn) => {
       if (dead) fn()
       else un = fn
@@ -55,8 +60,11 @@ export function AuthPromptDialog() {
     }
   }, [])
 
+  // Reset per-dialog state and focus whenever the HEAD changes.
   useEffect(() => {
     if (!request) return
+    setAnswers(request.prompts.map(() => ''))
+    setBusy(false)
     firstRef.current?.focus()
 
     const onKey = (e: KeyboardEvent) => {
@@ -68,7 +76,7 @@ export function AuthPromptDialog() {
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [request])
+  }, [request?.requestId])
 
   if (!request) return null
 
@@ -76,7 +84,8 @@ export function AuthPromptDialog() {
     if (!request) return
     setBusy(true)
     await safeInvoke('auth_prompt_respond', { requestId: request.requestId, answers: vals })
-    setRequest(null)
+    // Drop THIS prompt (by id) so the next queued challenge shows.
+    setQueue((q) => q.filter((r) => r.requestId !== request.requestId))
   }
 
   return (
