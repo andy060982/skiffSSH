@@ -290,21 +290,50 @@ pub async fn chat(
     };
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         // Provider error bodies are useful ("model not found", "invalid key")
-        // but can be huge HTML; cap them.
+        // but can be huge HTML. response.text() would buffer ALL of it before we
+        // truncate; instead stream only until we have enough to show, then stop.
+        let mut body = String::new();
+        let mut es = response.bytes_stream();
+        while body.len() < 8192 {
+            match es.next().await {
+                Some(Ok(chunk)) => body.push_str(&String::from_utf8_lossy(&chunk)),
+                _ => break,
+            }
+        }
         let snippet: String = body.chars().take(400).collect();
         return emit_err(&app, format!("{status}: {snippet}"));
     }
 
     // SSE parsing shared by both dialects: split on newlines, take `data:`
     // payloads, pull the text delta out of whichever shape this provider uses.
+    //
+    // Every accumulation here is bounded so a broken or hostile provider cannot
+    // exhaust memory: a single line without a newline is capped, the total
+    // stream is capped, and a stall triggers an idle timeout rather than hanging
+    // forever.
     let mut stream = response.bytes_stream();
     let mut buf = String::new();
+    let mut total: u64 = 0;
+    const MAX_SSE_LINE: usize = 1024 * 1024; // 1 MiB for one un-terminated line
+    const MAX_TOTAL: u64 = 16 * 1024 * 1024; // 16 MiB whole response
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
-    while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
+    loop {
+        let bytes = match tokio::time::timeout(IDLE, stream.next()).await {
+            Err(_) => return emit_err(&app, "response stalled (idle timeout)".into()),
+            Ok(None) => break,
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(_))) => break,
+        };
+        total = total.saturating_add(bytes.len() as u64);
+        if total > MAX_TOTAL {
+            return emit_err(&app, "response exceeded size limit".into());
+        }
         buf.push_str(&String::from_utf8_lossy(&bytes));
+        if buf.len() > MAX_SSE_LINE {
+            return emit_err(&app, "response line exceeded size limit".into());
+        }
 
         while let Some(nl) = buf.find('\n') {
             let line = buf[..nl].trim().to_string();
