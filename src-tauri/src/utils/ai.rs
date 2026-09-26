@@ -73,6 +73,22 @@ fn vault_profile(profile: &str) -> String {
     format!("ai:{profile}")
 }
 
+/// The (kind, base_url) the user actually SAVED for the AI provider, read from
+/// ai.json. This — not a value the caller passed in the same IPC call that also
+/// names the key's profile — is the authority for where an API key may be sent.
+/// (ai.json currently holds one flat provider config; revisit if it grows to a
+/// per-profile map.)
+fn saved_origin() -> Option<(String, String)> {
+    let cfg = crate::utils::hosts::load_named("ai.json").ok().flatten()?;
+    let kind = cfg.get("kind").and_then(|v| v.as_str())?.to_string();
+    let base_url = cfg
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((kind, base_url))
+}
+
 /// True if the URL targets loopback, so plain HTTP is acceptable (local Ollama
 /// / LM Studio). Parses the host out of the authority rather than a loose
 /// substring, so `http://localhost.evil.com` does NOT qualify.
@@ -219,6 +235,25 @@ pub async fn chat(
         }
         return;
     }
+
+    // Bind the API key to the ORIGIN the user saved for this profile rather
+    // than the base_url the caller passed: a compromised frontend could
+    // otherwise point this profile at its own server in the same call that
+    // names the key, and be handed the key. Only relevant when a key will be
+    // attached (hosted providers); a keyless/loopback call keeps what was
+    // passed. The HTTPS check below then runs against the SAVED origin.
+    let cfg = if key.is_some() {
+        match saved_origin() {
+            Some((kind, base_url)) if !base_url.is_empty() => ProviderConfig {
+                kind,
+                base_url,
+                model: cfg.model,
+            },
+            _ => cfg,
+        }
+    } else {
+        cfg
+    };
 
     // Enforce HTTPS for non-loopback endpoints: an API key and the session
     // context must never travel in cleartext to a remote host. Local providers

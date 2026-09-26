@@ -468,6 +468,16 @@ impl Registry {
         jump: Option<JumpParams>,
         one_shot_password: Option<&str>,
     ) -> Result<(), SshError> {
+        // Before dialing anything, refuse to send a saved password to a
+        // destination the catalogue never bound it to (both the target and any
+        // jump host). This fails fast, before we even connect to the requested
+        // host, so a compromised frontend cannot use the connection itself as an
+        // exfiltration channel for another host's stored secret.
+        authorize_stored_password(auth, host_id, host, port, username, one_shot_password)?;
+        if let Some(j) = jump.as_ref() {
+            authorize_stored_password(&j.auth, &j.host_id, &j.host, j.port, &j.username, None)?;
+        }
+
         // Resolve first so the prompt can show which machine actually answered.
         // Best-effort: a failure here is not fatal, the connect below will
         // produce a better error than we could.
@@ -1221,6 +1231,43 @@ impl Registry {
 
 /// Authenticate an open handle by the host's configured method.
 ///
+/// Refuse to send a *stored password* to a destination the saved catalogue
+/// never bound it to.
+///
+/// Only stored password auth transmits the vault secret to the server. Key auth
+/// uses the vault entry as a local key passphrase (it decrypts the key here and
+/// is never sent), and agent auth / a one-shot password carry no stored secret —
+/// so those are exempt. When a stored password exists for `host_id`, the
+/// destination must match a connection the user actually saved for that
+/// credential (its own record, or one that borrows it via `credentialId`);
+/// otherwise a compromised frontend could pair the id with an attacker's host
+/// and read the secret off the wire.
+fn authorize_stored_password(
+    auth: &str,
+    host_id: &str,
+    host: &str,
+    port: u16,
+    username: &str,
+    one_shot_password: Option<&str>,
+) -> Result<(), SshError> {
+    if one_shot_password.is_some() || matches!(auth, "key" | "agent") {
+        return Ok(());
+    }
+    // No saved secret for this id → nothing to leak; a bare password attempt
+    // simply fails later if the server demands one.
+    if !credentials::has_secret(host_id) {
+        return Ok(());
+    }
+    if crate::utils::hosts::binding_is_authorized(host_id, host, port, username) {
+        Ok(())
+    } else {
+        Err(SshError::AuthFailed(format!(
+            "refusing to send the saved credential '{host_id}' to {host}:{port} as {username}: \
+             it is not an authorized saved destination for that credential"
+        )))
+    }
+}
+
 /// Shared between the target connection and a jump-host connection so the
 /// bastion supports the same three methods as any other host.
 async fn authenticate(

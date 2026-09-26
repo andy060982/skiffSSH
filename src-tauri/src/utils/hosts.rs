@@ -144,6 +144,75 @@ pub fn save(tree: &Value) -> Result<(), KnownHostsError> {
 
 /* -------------------------------------------------------------------------- */
 
+/// Confirm that sending the vault secret keyed by `cred_id` to `host:port` as
+/// `username` matches a connection the user actually saved.
+///
+/// The catalogue is the authority. A saved host uses vault entry `cred_id` when
+/// its own `id` equals `cred_id` (its own secret) OR its `credentialId` borrows
+/// `cred_id` (the "same password as fw-01" feature). In either case the only
+/// destination that entry is authorized for is that record's own
+/// `hostname`/`port`/`username`.
+///
+/// Returns `false` when there is no catalogue or no matching record — so a
+/// compromised frontend that pairs a saved host's password id with an
+/// attacker-controlled destination matches nothing, and the secret is never
+/// sent there. This deliberately reads a few fields of the otherwise-opaque
+/// tree (see the module header): a security binding is worth the coupling.
+pub fn binding_is_authorized(cred_id: &str, host: &str, port: u16, username: &str) -> bool {
+    match load() {
+        Ok(Some(tree)) => binding_in_tree(&tree, cred_id, host, port, username),
+        // No catalogue (or unreadable) → cannot authorize sending a secret.
+        _ => false,
+    }
+}
+
+/// Pure form of [`binding_is_authorized`] over an already-parsed tree, so the
+/// authorization rule can be tested without touching the vault or disk.
+fn binding_in_tree(tree: &Value, cred_id: &str, host: &str, port: u16, username: &str) -> bool {
+    let mut ok = false;
+    walk_hosts(tree, &mut |node| {
+        if ok {
+            return;
+        }
+        let id = node.get("id").and_then(Value::as_str);
+        let borrows = node.get("credentialId").and_then(Value::as_str);
+        if id != Some(cred_id) && borrows != Some(cred_id) {
+            return;
+        }
+        let h = node.get("hostname").and_then(Value::as_str);
+        let p = node.get("port").and_then(Value::as_u64);
+        let u = node.get("username").and_then(Value::as_str);
+        if h == Some(host) && p == Some(u64::from(port)) && u == Some(username) {
+            ok = true;
+        }
+    });
+    ok
+}
+
+/// Visit every `kind: "host"` object in the opaque catalogue tree, descending
+/// folders and an array root. Reads only the shape the security binding needs.
+fn walk_hosts(node: &Value, visit: &mut impl FnMut(&Value)) {
+    if let Some(arr) = node.as_array() {
+        for child in arr {
+            walk_hosts(child, visit);
+        }
+        return;
+    }
+    match node.get("kind").and_then(Value::as_str) {
+        Some("host") => visit(node),
+        Some("folder") => {
+            if let Some(children) = node.get("children").and_then(Value::as_array) {
+                for child in children {
+                    walk_hosts(child, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+
 /// `%APPDATA%\skiff\sessions.json` — which hosts were open when the app last
 /// closed.
 ///
@@ -214,4 +283,49 @@ pub fn save_named(name: &str, value: &Value) -> Result<(), KnownHostsError> {
     let text =
         serde_json::to_string_pretty(value).map_err(|e| KnownHostsError::Parse(e.to_string()))?;
     write_atomic(&path, &text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binding_in_tree;
+    use serde_json::json;
+
+    fn catalogue() -> serde_json::Value {
+        json!([
+            { "kind": "host", "id": "fw-01", "hostname": "fw-01.corp", "port": 22, "username": "admin" },
+            { "kind": "folder", "id": "f1", "name": "DMZ", "children": [
+                // Borrows fw-01's vault entry ("same password as fw-01").
+                { "kind": "host", "id": "fw-02", "hostname": "fw-02.corp", "port": 2222,
+                  "username": "admin", "credentialId": "fw-01" }
+            ]}
+        ])
+    }
+
+    #[test]
+    fn own_entry_binds_only_to_its_own_destination() {
+        let t = catalogue();
+        // fw-01's credential to fw-01's own destination: authorized.
+        assert!(binding_in_tree(&t, "fw-01", "fw-01.corp", 22, "admin"));
+        // Same credential aimed at a DIFFERENT host/port/user: refused.
+        assert!(!binding_in_tree(&t, "fw-01", "attacker.example", 22, "admin"));
+        assert!(!binding_in_tree(&t, "fw-01", "fw-01.corp", 23, "admin"));
+        assert!(!binding_in_tree(&t, "fw-01", "fw-01.corp", 22, "root"));
+    }
+
+    #[test]
+    fn borrowed_entry_binds_to_the_borrowers_destination() {
+        let t = catalogue();
+        // fw-02 borrows fw-01's entry; connecting fw-02 passes cred_id=fw-01
+        // with fw-02's own destination — authorized (nested in a folder).
+        assert!(binding_in_tree(&t, "fw-01", "fw-02.corp", 2222, "admin"));
+        // But fw-01's entry may not be sent to an unrelated destination just
+        // because a borrower exists.
+        assert!(!binding_in_tree(&t, "fw-01", "fw-02.corp", 22, "admin"));
+    }
+
+    #[test]
+    fn unknown_credential_is_never_authorized() {
+        let t = catalogue();
+        assert!(!binding_in_tree(&t, "ghost", "fw-01.corp", 22, "admin"));
+    }
 }
