@@ -73,20 +73,87 @@ fn vault_profile(profile: &str) -> String {
     format!("ai:{profile}")
 }
 
-/// The (kind, base_url) the user actually SAVED for the AI provider, read from
-/// ai.json. This — not a value the caller passed in the same IPC call that also
-/// names the key's profile — is the authority for where an API key may be sent.
-/// (ai.json currently holds one flat provider config; revisit if it grows to a
-/// per-profile map.)
-fn saved_origin() -> Option<(String, String)> {
-    let cfg = crate::utils::hosts::load_named("ai.json").ok().flatten()?;
-    let kind = cfg.get("kind").and_then(|v| v.as_str())?.to_string();
-    let base_url = cfg
+// Backend-owned record of the origin (kind + base_url) each AI profile's key
+// may be sent to, in `ai_origins.json`. Written only at key-save time and at
+// startup migration — never through a frontend command — so a compromised
+// webview that rewrites the frontend-owned ai.json cannot redirect the key to
+// its own server. Mirrors the SSH credential→destination binding.
+
+fn ai_origins_path() -> Option<std::path::PathBuf> {
+    crate::utils::known_hosts::store_path()
+        .ok()?
+        .parent()
+        .map(|p| p.join("ai_origins.json"))
+}
+
+fn load_ai_origins() -> serde_json::Value {
+    let Some(path) = ai_origins_path() else {
+        return json!({});
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    }
+}
+
+fn write_ai_origins(map: &serde_json::Value) {
+    let Some(path) = ai_origins_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(map) {
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Record, in backend-owned state, the origin this profile's key may be sent to.
+pub fn snapshot_origin(profile: &str, kind: &str, base_url: &str) {
+    let mut map = load_ai_origins();
+    if !map.is_object() {
+        map = json!({});
+    }
+    if let Some(obj) = map.as_object_mut() {
+        obj.insert(profile.to_string(), json!({ "kind": kind, "baseUrl": base_url }));
+    }
+    write_ai_origins(&map);
+}
+
+/// The (kind, base_url) the key for `profile` is bound to, from backend-owned
+/// state — never the frontend-writable ai.json.
+fn saved_origin(profile: &str) -> Option<(String, String)> {
+    let map = load_ai_origins();
+    let o = map.get(profile)?;
+    let kind = o.get("kind").and_then(|v| v.as_str())?.to_string();
+    let base_url = o
         .get("baseUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     Some((kind, base_url))
+}
+
+/// Backfill: if a profile has a saved key but no backend origin yet, snapshot it
+/// from ai.json at STARTUP — before the webview can poison ai.json.
+pub fn migrate_ai_origins() {
+    // One "default" profile today; extend the list if profiles become plural.
+    for profile in ["default"] {
+        if !key_exists(profile) || saved_origin(profile).is_some() {
+            continue;
+        }
+        if let Ok(Some(cfg)) = crate::utils::hosts::load_named("ai.json") {
+            let kind = cfg.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let base_url = cfg.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+            if !kind.is_empty() {
+                snapshot_origin(profile, kind, base_url);
+            }
+        }
+    }
 }
 
 /// True if the URL targets loopback, so plain HTTP is acceptable (local Ollama
@@ -107,8 +174,12 @@ fn is_loopback_url(url: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
 }
 
-pub fn save_key(profile: &str, key: &str) -> Result<(), String> {
-    credentials::write_secret(&vault_profile(profile), "api-key", key).map_err(|e| e.to_string())
+pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
+    credentials::write_secret(&vault_profile(profile), "api-key", key).map_err(|e| e.to_string())?;
+    // Bind the key to the origin at save time (human present), in backend-owned
+    // state, so a later poisoned ai.json cannot redirect it.
+    snapshot_origin(profile, kind, base_url);
+    Ok(())
 }
 
 pub fn key_exists(profile: &str) -> bool {
@@ -243,7 +314,7 @@ pub async fn chat(
     // attached (hosted providers); a keyless/loopback call keeps what was
     // passed. The HTTPS check below then runs against the SAVED origin.
     let cfg = if key.is_some() {
-        match saved_origin() {
+        match saved_origin(&profile) {
             Some((kind, base_url)) if !base_url.is_empty() => ProviderConfig {
                 kind,
                 base_url,
