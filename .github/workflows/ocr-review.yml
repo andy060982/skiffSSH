@@ -38,10 +38,16 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  # pull_request_target so the Anthropic key is available even for fork PRs.
-  # Safe here: the action only reads the diff, it never executes PR code.
-  pull_request_target:
-    types: [opened, synchronize, reopened]
+  # On-demand only: comment "/open-code-review" on a PR (repo members/owners
+  # only) to run a review.
+  #
+  # The automatic per-PR trigger (pull_request_target) was removed 2026-09-26.
+  # The bot's own request to Anthropic was returning HTTP 400 (0 tokens — an
+  # OCR_LLM_* model/key/URL config issue, not a code issue), red-X'ing every PR,
+  # and Codex/Zeus-Jack is the project's required reviewer regardless. To
+  # re-enable automatic review once the OCR_LLM_* settings are fixed, restore:
+  #   pull_request_target:
+  #     types: [opened, synchronize, reopened]
   issue_comment:
     types: [created]
 
