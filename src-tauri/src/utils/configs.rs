@@ -79,11 +79,15 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
         .unwrap_or(0);
     let name = format!("{}.txt", super::session_log::timestamp_for(now));
     let path = dir.join(&name);
-    std::fs::write(&path, content).map_err(|source| KnownHostsError::Io {
-        path: path.clone(),
-        source,
+    // Create the snapshot owner-only in one step: a config dump can hold
+    // secrets, and a plain write-then-chmod leaves a window where it is
+    // group/world-readable under a permissive umask.
+    super::platform::write_private(&path, content.as_bytes()).map_err(|source| {
+        KnownHostsError::Io {
+            path: path.clone(),
+            source,
+        }
     })?;
-    super::platform::restrict_perms(&path, 0o600);
 
     let (added, removed) = match previous {
         Some(prev_path) => {
