@@ -166,8 +166,14 @@ impl SessionLog {
         self.partial = leftover;
 
         if !text.is_empty() {
-            let _ = self.file.write_all(&text);
-            self.written = self.written.saturating_add(text.len() as u64);
+            // Write only up to the remaining budget, so a single oversized chunk
+            // cannot blow past the cap before the check below flips it on.
+            let remaining = MAX_LOG_BYTES.saturating_sub(self.written);
+            let take = std::cmp::min(remaining, text.len() as u64) as usize;
+            if take > 0 {
+                let _ = self.file.write_all(&text[..take]);
+                self.written = self.written.saturating_add(take as u64);
+            }
             if self.written >= MAX_LOG_BYTES {
                 let _ = writeln!(
                     self.file,
