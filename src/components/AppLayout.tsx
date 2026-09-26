@@ -825,6 +825,25 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           if (cur) setTunnelFor(cur)
         },
       },
+      {
+        label: 'Capture command output…',
+        disabled: dead || !host,
+        onSelect: () => {
+          const command = window.prompt(
+            'Command to run — its full output is saved to a file (e.g. show tech-support):',
+          )?.trim()
+          if (!command || !host) return
+          void safeInvoke<{ path: string; bytes: number; lines: number }>('capture_output', {
+            sessionId,
+            host: host.name,
+            command,
+          })
+            .then((r) => {
+              if (r) window.alert(`Saved ${r.lines} line(s), ${r.bytes} bytes to:\n${r.path}`)
+            })
+            .catch((e) => window.alert(`Capture failed: ${e instanceof Error ? e.message : e}`))
+        },
+      },
       { label: 'Close tab', danger: true, dividerBefore: true, onSelect: () => closeSession(sessionId) },
     ]
     setMenu({ x, y, items })
