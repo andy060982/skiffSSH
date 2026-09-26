@@ -672,8 +672,10 @@ async fn credential_save(
     // destination (and to any catalogue borrower of it). ssh_connect authorizes
     // against this — not the frontend-writable hosts.json — so a later poisoned
     // catalogue cannot redirect the secret. Done here, where the human just
-    // supplied the secret, is the trustworthy moment to bind it.
-    utils::hosts::snapshot_binding(&host_id, &host, port, &username);
+    // supplied the secret, is the trustworthy moment to bind it. Propagated so
+    // the save is atomic: if the binding cannot be written, the save fails
+    // rather than silently leaving a secret that ssh_connect will later refuse.
+    utils::hosts::snapshot_binding(&host_id, &host, port, &username).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -701,16 +703,16 @@ pub fn run() {
             app.manage(Arc::new(HostKeyPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
 
-            // Backfill credential→destination bindings for already-saved
-            // passwords, from the on-disk catalogue, BEFORE the webview loads
-            // (so it reads last session's trusted file, not something a
-            // compromised frontend could poison this run). New saves bind via
-            // credential_save; this covers pre-existing ones. Off-thread so a
-            // large catalogue never delays the window.
-            std::thread::spawn(|| {
-                let _ = std::panic::catch_unwind(utils::hosts::migrate_bindings);
-                let _ = std::panic::catch_unwind(utils::ai::migrate_ai_origins);
-            });
+            // Backfill credential→destination and AI-origin bindings for
+            // already-saved secrets, from the on-disk catalogue. This MUST run
+            // synchronously here, before setup returns and the webview can
+            // invoke any command: if it were spawned, a compromised frontend
+            // could race it — poisoning hosts.json via hosts_save before the
+            // migration reads it — and reintroduce the frontend-writable-source
+            // bug. Run inline (small catalogue + a few vault reads); a panic is
+            // contained so a migration hiccup never blocks startup.
+            let _ = std::panic::catch_unwind(utils::hosts::migrate_bindings);
+            let _ = std::panic::catch_unwind(utils::ai::migrate_ai_origins);
 
             // Prune old transcripts on launch. Defaults chosen to keep a useful
             // window of history without letting plaintext firewall logs pile up

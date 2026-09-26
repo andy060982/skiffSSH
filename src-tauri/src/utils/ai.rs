@@ -96,24 +96,27 @@ fn load_ai_origins() -> serde_json::Value {
     }
 }
 
-fn write_ai_origins(map: &serde_json::Value) {
-    let Some(path) = ai_origins_path() else {
-        return;
-    };
+fn write_ai_origins(map: &serde_json::Value) -> Result<(), String> {
+    let path = ai_origins_path().ok_or_else(|| "no app-data dir for ai_origins".to_string())?;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    if let Ok(text) = serde_json::to_string_pretty(map) {
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::rename(&tmp, &path);
-        }
+    let text = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })?;
     }
+    Ok(())
 }
 
 /// Record, in backend-owned state, the origin this profile's key may be sent to.
-pub fn snapshot_origin(profile: &str, kind: &str, base_url: &str) {
+/// Errors propagate so key-save can be atomic (see `save_key`).
+pub fn snapshot_origin(profile: &str, kind: &str, base_url: &str) -> Result<(), String> {
     let mut map = load_ai_origins();
     if !map.is_object() {
         map = json!({});
@@ -121,7 +124,7 @@ pub fn snapshot_origin(profile: &str, kind: &str, base_url: &str) {
     if let Some(obj) = map.as_object_mut() {
         obj.insert(profile.to_string(), json!({ "kind": kind, "baseUrl": base_url }));
     }
-    write_ai_origins(&map);
+    write_ai_origins(&map)
 }
 
 /// The (kind, base_url) the key for `profile` is bound to, from backend-owned
@@ -150,7 +153,9 @@ pub fn migrate_ai_origins() {
             let kind = cfg.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let base_url = cfg.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
             if !kind.is_empty() {
-                snapshot_origin(profile, kind, base_url);
+                // Best-effort backfill: on failure the key simply stays unbound
+                // and chat fails closed until the key is re-saved — safe.
+                let _ = snapshot_origin(profile, kind, base_url);
             }
         }
     }
@@ -177,8 +182,10 @@ fn is_loopback_url(url: &str) -> bool {
 pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
     credentials::write_secret(&vault_profile(profile), "api-key", key).map_err(|e| e.to_string())?;
     // Bind the key to the origin at save time (human present), in backend-owned
-    // state, so a later poisoned ai.json cannot redirect it.
-    snapshot_origin(profile, kind, base_url);
+    // state, so a later poisoned ai.json cannot redirect it. Propagated so the
+    // save is atomic: if the origin cannot be persisted, the save fails rather
+    // than leaving a key that chat would then refuse to use.
+    snapshot_origin(profile, kind, base_url)?;
     Ok(())
 }
 
@@ -313,6 +320,11 @@ pub async fn chat(
     // names the key, and be handed the key. Only relevant when a key will be
     // attached (hosted providers); a keyless/loopback call keeps what was
     // passed. The HTTPS check below then runs against the SAVED origin.
+    //
+    // Fail CLOSED: if a key will be attached but there is no clean backend
+    // origin for this profile, refuse rather than fall back to the caller's
+    // base_url — otherwise a poisoned/absent origin record would let the key be
+    // sent to a frontend-chosen destination.
     let cfg = if key.is_some() {
         match saved_origin(&profile) {
             Some((kind, base_url)) if !base_url.is_empty() => ProviderConfig {
@@ -320,7 +332,12 @@ pub async fn chat(
                 base_url,
                 model: cfg.model,
             },
-            _ => cfg,
+            _ => {
+                return emit_err(
+                    &app,
+                    "This provider's API key is not bound to a saved origin. Open AI settings and re-save the key to bind it before chatting.".into(),
+                );
+            }
         }
     } else {
         cfg

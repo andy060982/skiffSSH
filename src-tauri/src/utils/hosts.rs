@@ -239,7 +239,12 @@ fn dests_for_cred(cred_id: &str) -> Vec<Value> {
 /// The owner's own (host, port, username) is passed explicitly (authoritative,
 /// and free of any hosts.json write-ordering dependency); catalogue borrowers of
 /// `cred_id` present at this moment are included too.
-pub fn snapshot_binding(cred_id: &str, host: &str, port: u16, username: &str) {
+pub fn snapshot_binding(
+    cred_id: &str,
+    host: &str,
+    port: u16,
+    username: &str,
+) -> Result<(), KnownHostsError> {
     let mut dests = dests_for_cred(cred_id);
     let owner = json!({ "host": host, "port": u64::from(port), "username": username });
     if !dests.contains(&owner) {
@@ -252,7 +257,10 @@ pub fn snapshot_binding(cred_id: &str, host: &str, port: u16, username: &str) {
     if let Some(obj) = map.as_object_mut() {
         obj.insert(cred_id.to_string(), Value::Array(dests));
     }
-    let _ = write_bindings(&map);
+    // Propagate a write failure so credential_save can be atomic from the user's
+    // point of view: a saved secret whose binding failed to persist would later
+    // be refused by ssh_connect (fail-closed), which is safe but surprising.
+    write_bindings(&map)
 }
 
 /// Drop a credential's bindings (called when its secret is deleted).
@@ -319,7 +327,9 @@ pub fn migrate_bindings() {
             continue;
         }
         if crate::credentials::has_secret(&cred) {
-            snapshot_binding(&cred, &h, p as u16, &u);
+            // Best-effort backfill: a write failure here just leaves this cred
+            // unbound, so ssh_connect fails closed and the user re-saves — safe.
+            let _ = snapshot_binding(&cred, &h, p as u16, &u);
             done.insert(cred);
         }
     }
