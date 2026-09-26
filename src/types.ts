@@ -159,6 +159,20 @@ export interface Transfer {
   bytesTotal: number
   status: 'active' | 'done' | 'error'
   error?: string
+  /** Per-file failures accumulated from `sftp://failure` events during a
+   *  recursive (folder) transfer. Lets the UI show the FULL list — not just the
+   *  first — and retry exactly the files that didn't make it. */
+  failures?: TransferFailureItem[]
+}
+
+/** One failed file inside a recursive transfer, with both sides retained so a
+ *  "Retry failed" can rebuild the exact job. `local` may be empty for items that
+ *  were skipped rather than attempted (e.g. an unsafe server-supplied name). */
+export interface TransferFailureItem {
+  name: string
+  local: string
+  remote: string
+  reason: string
 }
 
 /** Payload of the `sftp://progress` event. Mirrors TransferProgress in
@@ -172,4 +186,17 @@ export interface TransferProgressEvent {
   totalBytes: number
   direction: TransferDirection
   done: boolean
+}
+
+/** Payload of the `sftp://failure` event. Mirrors TransferFailure in
+ *  src-tauri/src/ssh.rs — change the two together. `root` is the transfer's
+ *  source path, matching the queue row's `path`. */
+export interface TransferFailureEvent {
+  sessionId: string
+  root: string
+  name: string
+  local: string
+  remote: string
+  reason: string
+  direction: TransferDirection
 }
