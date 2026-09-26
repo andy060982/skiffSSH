@@ -613,8 +613,13 @@ async fn ai_chat(
 }
 
 #[tauri::command]
-async fn ai_key_save(profile: String, key: String) -> CmdResult<()> {
-    utils::ai::save_key(&profile, &key)
+async fn ai_key_save(
+    profile: String,
+    key: String,
+    kind: String,
+    base_url: String,
+) -> CmdResult<()> {
+    utils::ai::save_key(&profile, &key, &kind, &base_url)
 }
 
 #[tauri::command]
@@ -655,8 +660,23 @@ async fn settings_save(settings: serde_json::Value) -> CmdResult<()> {
 /// just typed it into the host editor. It goes straight into the OS vault and
 /// is never echoed back: there is deliberately no `credential_read` command.
 #[tauri::command]
-async fn credential_save(host_id: String, username: String, password: String) -> CmdResult<()> {
-    credentials::write_secret(&host_id, &username, &password).map_err(|e| e.to_string())
+async fn credential_save(
+    host_id: String,
+    username: String,
+    password: String,
+    host: String,
+    port: u16,
+) -> CmdResult<()> {
+    credentials::write_secret(&host_id, &username, &password).map_err(|e| e.to_string())?;
+    // Record, in backend-owned state, that this secret may be sent to this
+    // destination (and to any catalogue borrower of it). ssh_connect authorizes
+    // against this — not the frontend-writable hosts.json — so a later poisoned
+    // catalogue cannot redirect the secret. Done here, where the human just
+    // supplied the secret, is the trustworthy moment to bind it. Propagated so
+    // the save is atomic: if the binding cannot be written, the save fails
+    // rather than silently leaving a secret that ssh_connect will later refuse.
+    utils::hosts::snapshot_binding(&host_id, &host, port, &username).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Whether a password is stored, without decrypting it — lets the UI show
@@ -668,7 +688,9 @@ async fn credential_status(host_id: String) -> CmdResult<bool> {
 
 #[tauri::command]
 async fn credential_delete(host_id: String) -> CmdResult<()> {
-    credentials::delete_secret(&host_id).map_err(|e| e.to_string())
+    credentials::delete_secret(&host_id).map_err(|e| e.to_string())?;
+    utils::hosts::remove_binding(&host_id);
+    Ok(())
 }
 
 /* --------------------------------------------------------------------- run */
@@ -680,6 +702,17 @@ pub fn run() {
             app.manage(Registry::default());
             app.manage(Arc::new(HostKeyPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
+
+            // Backfill credential→destination and AI-origin bindings for
+            // already-saved secrets, from the on-disk catalogue. This MUST run
+            // synchronously here, before setup returns and the webview can
+            // invoke any command: if it were spawned, a compromised frontend
+            // could race it — poisoning hosts.json via hosts_save before the
+            // migration reads it — and reintroduce the frontend-writable-source
+            // bug. Run inline (small catalogue + a few vault reads); a panic is
+            // contained so a migration hiccup never blocks startup.
+            let _ = std::panic::catch_unwind(utils::hosts::migrate_bindings);
+            let _ = std::panic::catch_unwind(utils::ai::migrate_ai_origins);
 
             // Prune old transcripts on launch. Defaults chosen to keep a useful
             // window of history without letting plaintext firewall logs pile up

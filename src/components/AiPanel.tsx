@@ -138,7 +138,15 @@ export function AiPanel({
     setCfg(next)
     await safeInvoke('ai_config_save', { config: next })
     if (keyDraft.trim()) {
-      await safeInvoke('ai_key_save', { profile: 'default', key: keyDraft.trim() })
+      // Pass the origin so the backend can bind the key to it (see save_key):
+      // the key may then only be sent to this kind/base_url, regardless of any
+      // later edit to ai.json.
+      await safeInvoke('ai_key_save', {
+        profile: 'default',
+        key: keyDraft.trim(),
+        kind: next.kind,
+        baseUrl: next.baseUrl,
+      })
       setKeyDraft('')
       setKeySaved(true)
     }

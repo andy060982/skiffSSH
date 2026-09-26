@@ -111,6 +111,11 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           hostId: draft.id,
           username: draft.username,
           password,
+          // The backend binds this secret to this destination (see
+          // credential_save): it may only ever be sent here (and to catalogue
+          // hosts that borrow it), regardless of later hosts.json edits.
+          host: draft.hostname,
+          port: draft.port,
         })
       }
       // Write the array and clear the legacy single-command field, so the two

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::known_hosts::KnownHostsError;
 
@@ -144,6 +144,221 @@ pub fn save(tree: &Value) -> Result<(), KnownHostsError> {
 
 /* -------------------------------------------------------------------------- */
 
+// -------------------------------------------------------------------------
+// Backend-owned credential→destination bindings.
+//
+// `ssh_connect` must not decide "may this saved password go to this host?" by
+// reading the FRONTEND-owned catalogue (hosts.json): a compromised webview can
+// rewrite that file via `hosts_save`, add an attacker destination that borrows
+// a victim's `credentialId`, then connect — and the backend would treat it as
+// authorized. So the authorization lives in a file only the backend writes:
+// `credential_bindings.json`, mapping `cred_id -> [ {host,port,username}, … ]`.
+//
+// It is written ONLY at credential-save time (the human is present and just
+// typed the secret) and, once, at startup migration (from the on-disk catalogue
+// BEFORE the webview loads). Repointing a binding therefore requires calling
+// `credential_save`, which overwrites the secret itself — so an attacker cannot
+// keep a victim's password while redirecting it. Later edits to hosts.json have
+// no effect on what is authorized.
+// -------------------------------------------------------------------------
+
+fn bindings_path() -> Result<PathBuf, KnownHostsError> {
+    let store = super::known_hosts::store_path()?;
+    Ok(store
+        .parent()
+        .ok_or(KnownHostsError::NoAppDataDir)?
+        .join("credential_bindings.json"))
+}
+
+fn load_bindings() -> Value {
+    let Ok(path) = bindings_path() else {
+        return json!({});
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    }
+}
+
+fn write_bindings(map: &Value) -> Result<(), KnownHostsError> {
+    let path = bindings_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| KnownHostsError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let text =
+        serde_json::to_string_pretty(map).map_err(|e| KnownHostsError::Parse(e.to_string()))?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|source| KnownHostsError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp, &path).map_err(|source| {
+            let _ = std::fs::remove_file(&tmp);
+            KnownHostsError::Io {
+                path: path.clone(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Catalogue destinations that legitimately use vault entry `cred_id`: the owner
+/// record (`id == cred_id`) and any borrower (`credentialId == cred_id`), each
+/// contributing its own `hostname`/`port`/`username`.
+fn dests_for_cred(cred_id: &str) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    if let Ok(Some(tree)) = load() {
+        walk_hosts(&tree, &mut |node| {
+            let id = node.get("id").and_then(Value::as_str);
+            let borrows = node.get("credentialId").and_then(Value::as_str);
+            if id != Some(cred_id) && borrows != Some(cred_id) {
+                return;
+            }
+            if let (Some(h), Some(p), Some(u)) = (
+                node.get("hostname").and_then(Value::as_str),
+                node.get("port").and_then(Value::as_u64),
+                node.get("username").and_then(Value::as_str),
+            ) {
+                let d = json!({ "host": h, "port": p, "username": u });
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Record the destinations `cred_id` may be sent to, in backend-owned state.
+/// The owner's own (host, port, username) is passed explicitly (authoritative,
+/// and free of any hosts.json write-ordering dependency); catalogue borrowers of
+/// `cred_id` present at this moment are included too.
+pub fn snapshot_binding(
+    cred_id: &str,
+    host: &str,
+    port: u16,
+    username: &str,
+) -> Result<(), KnownHostsError> {
+    let mut dests = dests_for_cred(cred_id);
+    let owner = json!({ "host": host, "port": u64::from(port), "username": username });
+    if !dests.contains(&owner) {
+        dests.push(owner);
+    }
+    let mut map = load_bindings();
+    if !map.is_object() {
+        map = json!({});
+    }
+    if let Some(obj) = map.as_object_mut() {
+        obj.insert(cred_id.to_string(), Value::Array(dests));
+    }
+    // Propagate a write failure so credential_save can be atomic from the user's
+    // point of view: a saved secret whose binding failed to persist would later
+    // be refused by ssh_connect (fail-closed), which is safe but surprising.
+    write_bindings(&map)
+}
+
+/// Drop a credential's bindings (called when its secret is deleted).
+pub fn remove_binding(cred_id: &str) {
+    let mut map = load_bindings();
+    if let Some(obj) = map.as_object_mut() {
+        if obj.remove(cred_id).is_some() {
+            let _ = write_bindings(&map);
+        }
+    }
+}
+
+/// Authorize sending the vault secret keyed by `cred_id` to `host:port` as
+/// `username`, consulting ONLY the backend-owned binding file — never the
+/// frontend-writable catalogue. Unknown credential or unmatched destination
+/// returns false (fail closed).
+pub fn binding_is_authorized(cred_id: &str, host: &str, port: u16, username: &str) -> bool {
+    let map = load_bindings();
+    let Some(list) = map.get(cred_id).and_then(Value::as_array) else {
+        return false;
+    };
+    dest_authorized_in(list, host, port, username)
+}
+
+/// Pure membership check, split out so the authorization rule is testable
+/// without touching disk.
+fn dest_authorized_in(list: &[Value], host: &str, port: u16, username: &str) -> bool {
+    let want = json!({ "host": host, "port": u64::from(port), "username": username });
+    list.iter().any(|d| d == &want)
+}
+
+/// One-time backfill: for every catalogue host that has a saved secret but no
+/// binding yet, snapshot it now. Called at STARTUP, before the webview loads —
+/// so the catalogue it reads is last session's on-disk file, not something a
+/// compromised frontend could have poisoned this run.
+pub fn migrate_bindings() {
+    let Ok(Some(tree)) = load() else {
+        return;
+    };
+    let mut done: std::collections::BTreeSet<String> = load_bindings()
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+
+    // Collect (cred_id, host, port, username) for every host first, so we are
+    // not holding the tree borrow across the vault reads / writes below.
+    let mut rows: Vec<(String, String, u64, String)> = Vec::new();
+    walk_hosts(&tree, &mut |node| {
+        let id = node.get("id").and_then(Value::as_str);
+        // The vault key is credentialId when borrowing, else the host's own id.
+        let cred = node.get("credentialId").and_then(Value::as_str).or(id);
+        if let (Some(cred), Some(h), Some(p), Some(u)) = (
+            cred,
+            node.get("hostname").and_then(Value::as_str),
+            node.get("port").and_then(Value::as_u64),
+            node.get("username").and_then(Value::as_str),
+        ) {
+            rows.push((cred.to_string(), h.to_string(), p, u.to_string()));
+        }
+    });
+
+    for (cred, h, p, u) in rows {
+        if done.contains(&cred) {
+            continue;
+        }
+        if crate::credentials::has_secret(&cred) {
+            // Best-effort backfill: a write failure here just leaves this cred
+            // unbound, so ssh_connect fails closed and the user re-saves — safe.
+            let _ = snapshot_binding(&cred, &h, p as u16, &u);
+            done.insert(cred);
+        }
+    }
+}
+
+/// Visit every `kind: "host"` object in the opaque catalogue tree, descending
+/// folders and an array root. Reads only the shape the security binding needs.
+fn walk_hosts(node: &Value, visit: &mut impl FnMut(&Value)) {
+    if let Some(arr) = node.as_array() {
+        for child in arr {
+            walk_hosts(child, visit);
+        }
+        return;
+    }
+    match node.get("kind").and_then(Value::as_str) {
+        Some("host") => visit(node),
+        Some("folder") => {
+            if let Some(children) = node.get("children").and_then(Value::as_array) {
+                for child in children {
+                    walk_hosts(child, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+
 /// `%APPDATA%\skiff\sessions.json` — which hosts were open when the app last
 /// closed.
 ///
@@ -214,4 +429,46 @@ pub fn save_named(name: &str, value: &Value) -> Result<(), KnownHostsError> {
     let text =
         serde_json::to_string_pretty(value).map_err(|e| KnownHostsError::Parse(e.to_string()))?;
     write_atomic(&path, &text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dest_authorized_in, walk_hosts};
+    use serde_json::{json, Value};
+
+    // A recorded binding list is authorized only for the exact destinations in
+    // it, whatever their host/port/user — matching the tuple, nothing looser.
+    #[test]
+    fn dest_membership_is_exact() {
+        let list = vec![
+            json!({ "host": "fw-01.corp", "port": 22u64, "username": "admin" }),
+            json!({ "host": "fw-02.corp", "port": 2222u64, "username": "admin" }),
+        ];
+        assert!(dest_authorized_in(&list, "fw-01.corp", 22, "admin"));
+        assert!(dest_authorized_in(&list, "fw-02.corp", 2222, "admin")); // a borrower dest
+        assert!(!dest_authorized_in(&list, "attacker.example", 22, "admin"));
+        assert!(!dest_authorized_in(&list, "fw-01.corp", 23, "admin")); // wrong port
+        assert!(!dest_authorized_in(&list, "fw-01.corp", 22, "root")); // wrong user
+        assert!(!dest_authorized_in(&[], "fw-01.corp", 22, "admin")); // no binding
+    }
+
+    // walk_hosts must reach hosts nested inside folders and an array root, since
+    // that is how snapshot/migration enumerate borrowers.
+    #[test]
+    fn walk_hosts_descends_folders_and_array_root() {
+        let tree = json!([
+            { "kind": "host", "id": "a", "hostname": "a.h", "port": 22, "username": "u" },
+            { "kind": "folder", "id": "f", "name": "F", "children": [
+                { "kind": "host", "id": "b", "hostname": "b.h", "port": 22, "username": "u",
+                  "credentialId": "a" }
+            ]}
+        ]);
+        let mut ids: Vec<String> = Vec::new();
+        walk_hosts(&tree, &mut |n: &Value| {
+            if let Some(id) = n.get("id").and_then(Value::as_str) {
+                ids.push(id.to_string());
+            }
+        });
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
 }

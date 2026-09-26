@@ -73,6 +73,94 @@ fn vault_profile(profile: &str) -> String {
     format!("ai:{profile}")
 }
 
+// Backend-owned record of the origin (kind + base_url) each AI profile's key
+// may be sent to, in `ai_origins.json`. Written only at key-save time and at
+// startup migration — never through a frontend command — so a compromised
+// webview that rewrites the frontend-owned ai.json cannot redirect the key to
+// its own server. Mirrors the SSH credential→destination binding.
+
+fn ai_origins_path() -> Option<std::path::PathBuf> {
+    crate::utils::known_hosts::store_path()
+        .ok()?
+        .parent()
+        .map(|p| p.join("ai_origins.json"))
+}
+
+fn load_ai_origins() -> serde_json::Value {
+    let Some(path) = ai_origins_path() else {
+        return json!({});
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    }
+}
+
+fn write_ai_origins(map: &serde_json::Value) -> Result<(), String> {
+    let path = ai_origins_path().ok_or_else(|| "no app-data dir for ai_origins".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })?;
+    }
+    Ok(())
+}
+
+/// Record, in backend-owned state, the origin this profile's key may be sent to.
+/// Errors propagate so key-save can be atomic (see `save_key`).
+pub fn snapshot_origin(profile: &str, kind: &str, base_url: &str) -> Result<(), String> {
+    let mut map = load_ai_origins();
+    if !map.is_object() {
+        map = json!({});
+    }
+    if let Some(obj) = map.as_object_mut() {
+        obj.insert(profile.to_string(), json!({ "kind": kind, "baseUrl": base_url }));
+    }
+    write_ai_origins(&map)
+}
+
+/// The (kind, base_url) the key for `profile` is bound to, from backend-owned
+/// state — never the frontend-writable ai.json.
+fn saved_origin(profile: &str) -> Option<(String, String)> {
+    let map = load_ai_origins();
+    let o = map.get(profile)?;
+    let kind = o.get("kind").and_then(|v| v.as_str())?.to_string();
+    let base_url = o
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((kind, base_url))
+}
+
+/// Backfill: if a profile has a saved key but no backend origin yet, snapshot it
+/// from ai.json at STARTUP — before the webview can poison ai.json.
+pub fn migrate_ai_origins() {
+    // One "default" profile today; extend the list if profiles become plural.
+    for profile in ["default"] {
+        if !key_exists(profile) || saved_origin(profile).is_some() {
+            continue;
+        }
+        if let Ok(Some(cfg)) = crate::utils::hosts::load_named("ai.json") {
+            let kind = cfg.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let base_url = cfg.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+            if !kind.is_empty() {
+                // Best-effort backfill: on failure the key simply stays unbound
+                // and chat fails closed until the key is re-saved — safe.
+                let _ = snapshot_origin(profile, kind, base_url);
+            }
+        }
+    }
+}
+
 /// True if the URL targets loopback, so plain HTTP is acceptable (local Ollama
 /// / LM Studio). Parses the host out of the authority rather than a loose
 /// substring, so `http://localhost.evil.com` does NOT qualify.
@@ -91,8 +179,14 @@ fn is_loopback_url(url: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
 }
 
-pub fn save_key(profile: &str, key: &str) -> Result<(), String> {
-    credentials::write_secret(&vault_profile(profile), "api-key", key).map_err(|e| e.to_string())
+pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
+    credentials::write_secret(&vault_profile(profile), "api-key", key).map_err(|e| e.to_string())?;
+    // Bind the key to the origin at save time (human present), in backend-owned
+    // state, so a later poisoned ai.json cannot redirect it. Propagated so the
+    // save is atomic: if the origin cannot be persisted, the save fails rather
+    // than leaving a key that chat would then refuse to use.
+    snapshot_origin(profile, kind, base_url)?;
+    Ok(())
 }
 
 pub fn key_exists(profile: &str) -> bool {
@@ -219,6 +313,35 @@ pub async fn chat(
         }
         return;
     }
+
+    // Bind the API key to the ORIGIN the user saved for this profile rather
+    // than the base_url the caller passed: a compromised frontend could
+    // otherwise point this profile at its own server in the same call that
+    // names the key, and be handed the key. Only relevant when a key will be
+    // attached (hosted providers); a keyless/loopback call keeps what was
+    // passed. The HTTPS check below then runs against the SAVED origin.
+    //
+    // Fail CLOSED: if a key will be attached but there is no clean backend
+    // origin for this profile, refuse rather than fall back to the caller's
+    // base_url — otherwise a poisoned/absent origin record would let the key be
+    // sent to a frontend-chosen destination.
+    let cfg = if key.is_some() {
+        match saved_origin(&profile) {
+            Some((kind, base_url)) if !base_url.is_empty() => ProviderConfig {
+                kind,
+                base_url,
+                model: cfg.model,
+            },
+            _ => {
+                return emit_err(
+                    &app,
+                    "This provider's API key is not bound to a saved origin. Open AI settings and re-save the key to bind it before chatting.".into(),
+                );
+            }
+        }
+    } else {
+        cfg
+    };
 
     // Enforce HTTPS for non-loopback endpoints: an API key and the session
     // context must never travel in cleartext to a remote host. Local providers
