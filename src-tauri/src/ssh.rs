@@ -331,9 +331,46 @@ pub struct Registry {
     /// pump keeps an Arc<Session> (hence the SSH Handle) alive and blocks on
     /// `read_half.wait()` forever after the tab is "closed".
     pumps: DashMap<String, tokio::task::JoinHandle<()>>,
-    /// Active local forwards: id -> (info, listener task). Aborting the task
-    /// closes the listener; established tunnels drain on their own.
-    forwards: DashMap<String, (ForwardInfo, tokio::task::JoinHandle<()>)>,
+    /// Active local/SOCKS forwards, keyed by forward id. See `Forward`.
+    forwards: DashMap<String, Forward>,
+}
+
+/// Everything needed to tear a forward down *completely*.
+///
+/// Aborting only the listener stops new connections but leaves already-
+/// established tunnels carrying traffic — a user who "stopped" a forward would
+/// still be leaking through the live ones. So each forward also owns the abort
+/// handles of the per-connection tunnel tasks it has spawned; tearing the
+/// forward down aborts those too.
+struct Forward {
+    info: ForwardInfo,
+    listener: tokio::task::JoinHandle<()>,
+    tunnels: TunnelHandles,
+}
+
+/// Join handles for the live per-connection tunnel tasks under one forward.
+/// `JoinHandle` rather than `AbortHandle` so teardown can *await* completion,
+/// not just request cancellation. A plain `std::sync::Mutex` (never held across
+/// an `.await`) is enough — pushes happen in the accept loop, and the whole set
+/// is drained on teardown.
+type TunnelHandles = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+/// Record a newly spawned tunnel task, pruning handles for tunnels that have
+/// already finished so a long-lived forward's set does not grow without bound.
+fn track_tunnel(tunnels: &TunnelHandles, handle: tokio::task::JoinHandle<()>) {
+    if let Ok(mut v) = tunnels.lock() {
+        v.retain(|h| !h.is_finished());
+        v.push(handle);
+    }
+}
+
+/// Remove and return all currently-tracked tunnel handles, so the caller can
+/// abort (and optionally await) them without holding the lock across `.await`.
+fn take_tunnels(tunnels: &TunnelHandles) -> Vec<tokio::task::JoinHandle<()>> {
+    match tunnels.lock() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => Vec::new(),
+    }
 }
 
 impl Registry {
@@ -349,19 +386,33 @@ impl Registry {
     /// sweep the session's forwards. Without the explicit disconnect the
     /// authenticated connection and remote shell keep running after the user
     /// thinks they have closed the tab.
+    ///
+    /// Teardown is awaited to completion before returning: `abort()` only
+    /// *requests* cancellation, so a caller that returned as soon as abort was
+    /// issued could report "disconnected" while the pump was still mid-poll,
+    /// still holding its `Arc<Session>` (and thus the SSH `Handle`). Awaiting the
+    /// aborted `JoinHandle`s makes "disconnected" mean the tasks have actually
+    /// stopped and their session references are gone.
     pub async fn remove(&self, id: &str) {
         let session = self.sessions.remove(id).map(|(_, s)| s);
 
-        // Stop the output pump first so it drops its Arc<Session> and stops
-        // emitting; then the only remaining Handle reference is ours below.
+        // Stop the output pump first, and WAIT for it to unwind, so it has
+        // dropped its Arc<Session> before we send the disconnect below — then
+        // the only remaining Handle reference is ours. An aborted JoinHandle
+        // resolves promptly (the pump blocks on a cancel-safe `read_half.wait()`)
+        // with a cancellation error, which we discard.
         if let Some((_, pump)) = self.pumps.remove(id) {
             pump.abort();
+            let _ = pump.await;
         }
 
         if let Some(session) = session {
             session.alive.store(false, Ordering::Relaxed);
             // Send SSH_MSG_DISCONNECT. Best-effort: if the link is already gone
-            // this errors harmlessly. This is what frees the transport.
+            // this errors harmlessly. This closes the transport and, with it,
+            // every channel — including any in-flight SFTP transfer, whose next
+            // read/write then fails and unwinds rather than continuing against a
+            // connection the user believes is closed.
             let _ = session
                 .handle
                 .disconnect(russh::Disconnect::ByApplication, "closed by user", "")
@@ -370,16 +421,26 @@ impl Registry {
 
         // A forward's transport is this session; with it gone the listener
         // would sit accepting connections it can never tunnel, forever. Sweep
-        // them here so closing a tab tears down its tunnels too.
+        // them here so closing a tab tears down its tunnels too, and await each
+        // aborted listener so teardown is complete before we return.
         let doomed: Vec<String> = self
             .forwards
             .iter()
-            .filter(|e| e.value().0.session_id == id)
+            .filter(|e| e.value().info.session_id == id)
             .map(|e| e.key().clone())
             .collect();
         for fid in doomed {
-            if let Some((_, (_, task))) = self.forwards.remove(&fid) {
-                task.abort();
+            if let Some((_, fw)) = self.forwards.remove(&fid) {
+                // Abort AND await every live tunnel, then the listener, so
+                // "disconnected" means the per-connection tunnel tasks have
+                // actually unwound and dropped their channels — not merely that
+                // cancellation was requested.
+                for h in take_tunnels(&fw.tunnels) {
+                    h.abort();
+                    let _ = h.await;
+                }
+                fw.listener.abort();
+                let _ = fw.listener.await;
             }
         }
     }
@@ -964,6 +1025,8 @@ impl Registry {
 
         let sess = Arc::clone(&session);
         let rhost = remote_host.to_string();
+        let tunnels: TunnelHandles = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tunnels_loop = Arc::clone(&tunnels);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut tcp, peer)) = listener.accept().await else { break };
@@ -981,21 +1044,33 @@ impl Registry {
                     // Drop this client and keep the listener alive.
                     continue;
                 };
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     let mut stream = channel.into_stream();
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
                 });
+                track_tunnel(&tunnels_loop, h);
             }
         });
 
-        self.forwards
-            .insert(info.id.clone(), (info.clone(), task));
+        self.forwards.insert(
+            info.id.clone(),
+            Forward {
+                info: info.clone(),
+                listener: task,
+                tunnels,
+            },
+        );
         Ok(info)
     }
 
+    /// Stop one forward: abort its live tunnels AND its listener, so no traffic
+    /// keeps flowing after the user stops it — not just the listener.
     pub fn forward_stop(&self, forward_id: &str) {
-        if let Some((_, (_, task))) = self.forwards.remove(forward_id) {
-            task.abort();
+        if let Some((_, fw)) = self.forwards.remove(forward_id) {
+            for h in take_tunnels(&fw.tunnels) {
+                h.abort();
+            }
+            fw.listener.abort();
         }
     }
 
@@ -1031,24 +1106,34 @@ impl Registry {
         };
 
         let sess = Arc::clone(&session);
+        let tunnels: TunnelHandles = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tunnels_loop = Arc::clone(&tunnels);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((tcp, peer)) = listener.accept().await else { break };
                 let sess = Arc::clone(&sess);
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     let _ = socks5_serve(sess, tcp, peer).await;
                 });
+                track_tunnel(&tunnels_loop, h);
             }
         });
 
-        self.forwards.insert(info.id.clone(), (info.clone(), task));
+        self.forwards.insert(
+            info.id.clone(),
+            Forward {
+                info: info.clone(),
+                listener: task,
+                tunnels,
+            },
+        );
         Ok(info)
     }
 
     pub fn forwards_list(&self, session_id: Option<&str>) -> Vec<ForwardInfo> {
         self.forwards
             .iter()
-            .map(|e| e.value().0.clone())
+            .map(|e| e.value().info.clone())
             .filter(|f| session_id.is_none_or(|sid| f.session_id == sid))
             .collect()
     }
