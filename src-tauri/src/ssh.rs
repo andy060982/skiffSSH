@@ -1609,7 +1609,6 @@ async fn request_auth_answers(
 /// config and are out of scope here — the UI offers the copyable command for
 /// those.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub async fn copy_id(
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
