@@ -37,19 +37,26 @@ interface HostKeyRequest {
    and never prompts.
 --------------------------------------------------------------------------- */
 export function HostKeyDialog() {
-  const [request, setRequest] = useState<HostKeyRequest | null>(null)
+  // A QUEUE, not a single slot. Two connections to unknown hosts each park on
+  // their own backend oneshot and can prompt concurrently; overwriting the
+  // visible request would strand the earlier one (it would sit until its 120s
+  // timeout) and could show one host's fingerprint while resolving another's.
+  // We show the head and reveal the next only after the current is answered.
+  const [queue, setQueue] = useState<HostKeyRequest[]>([])
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const cancelRef = useRef<HTMLButtonElement>(null)
+
+  const request = queue[0] ?? null
 
   useEffect(() => {
     let un: (() => void) | null = null
     let dead = false
 
     void safeListen<HostKeyRequest>('ssh://host-key-prompt', (payload) => {
-      setRequest(payload)
-      setBusy(false)
-      setCopied(false)
+      // Append, de-duping by requestId so a re-emitted event cannot enqueue the
+      // same prompt twice.
+      setQueue((q) => (q.some((r) => r.requestId === payload.requestId) ? q : [...q, payload]))
     }).then((fn) => {
       if (dead) fn()
       else un = fn
@@ -61,9 +68,12 @@ export function HostKeyDialog() {
     }
   }, [])
 
-  // Focus the safe action, and wire Escape to deny.
+  // Whenever the HEAD changes, reset per-dialog state, focus the safe action,
+  // and wire Escape to deny — for each queued prompt in turn.
   useEffect(() => {
     if (!request) return
+    setBusy(false)
+    setCopied(false)
     cancelRef.current?.focus()
 
     const onKey = (e: KeyboardEvent) => {
@@ -75,7 +85,7 @@ export function HostKeyDialog() {
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [request])
+  }, [request?.requestId])
 
   if (!request) return null
 
@@ -83,7 +93,8 @@ export function HostKeyDialog() {
     if (!request) return
     setBusy(true)
     await safeInvoke('host_key_respond', { requestId: request.requestId, accept })
-    setRequest(null)
+    // Remove THIS prompt (by id, not position) so the next queued one shows.
+    setQueue((q) => q.filter((r) => r.requestId !== request.requestId))
   }
 
   const copyFingerprint = async () => {
@@ -129,6 +140,11 @@ export function HostKeyDialog() {
             </h2>
             <p id="hk-desc" className="mt-0.5 text-[12.5px] text-ink-dim">
               Skiff has not connected to this server before.
+              {queue.length > 1 && (
+                <span className="ml-1 text-ink-faint">
+                  ({queue.length - 1} more {queue.length - 1 === 1 ? 'prompt' : 'prompts'} waiting)
+                </span>
+              )}
             </p>
           </div>
         </header>
