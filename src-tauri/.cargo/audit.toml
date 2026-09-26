@@ -1,0 +1,20 @@
+# cargo-audit configuration.
+#
+# Read by the `Security advisories` CI job (see .github/workflows/ci.yml), which
+# runs `cargo audit` against Cargo.lock so a newly published advisory against a
+# dependency fails the build and shows up in review.
+
+[advisories]
+# RUSTSEC-2023-0071 — "Marvin Attack" key-recovery timing sidechannel in `rsa`.
+# https://rustsec.org/advisories/RUSTSEC-2023-0071.html
+#
+# There is no fixed release of the `rsa` crate yet, so this cannot be resolved
+# by an upgrade. It is tracked, not dismissed:
+#   - Skiff uses `rsa` only transitively via the SSH stack, and only for SSH
+#     *signature* verification/creation, never RSA *decryption*. The Marvin
+#     attack is a decryption/PKCS#1v1.5-unpadding timing oracle; a security
+#     review (2026-09-24) found no reachable RSA-decryption oracle in this app.
+#   - Users are steered toward Ed25519 keys (the key generator defaults to it)
+#     and agent-backed auth, both of which avoid in-process RSA entirely.
+# Revisit and remove this entry the moment a patched `rsa` is available.
+ignore = ["RUSTSEC-2023-0071"]
