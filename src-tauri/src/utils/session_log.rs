@@ -101,6 +101,9 @@ impl SessionLog {
             path: dir.clone(),
             source,
         })?;
+        // A transcript holds everything the session displayed, in plaintext, so
+        // it is as sensitive as the session was. Keep the directory owner-only.
+        super::platform::restrict_perms(&dir, 0o700);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -109,14 +112,22 @@ impl SessionLog {
 
         let path = dir.join(format!("{}_{}.log", slug(host), timestamp_name(now)));
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| KnownHostsError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        let mut open = OpenOptions::new();
+        open.create(true).append(true);
+        // Create the file 0600 up front on Unix so it is never briefly world-
+        // readable between create and chmod.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        let mut file = open.open(&path).map_err(|source| KnownHostsError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        // Also tighten an already-existing log (mode above only applies on
+        // create), so appending to an older transcript locks it down too.
+        super::platform::restrict_perms(&path, 0o600);
 
         let _ = writeln!(
             file,

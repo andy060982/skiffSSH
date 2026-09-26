@@ -67,6 +67,9 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
         path: dir.clone(),
         source,
     })?;
+    // A device config dump can hold SNMP communities, pre-shared keys, and other
+    // secrets, so keep the per-host snapshot directory owner-only.
+    super::platform::restrict_perms(&dir, 0o700);
 
     let previous = newest(&dir);
 
@@ -76,9 +79,14 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
         .unwrap_or(0);
     let name = format!("{}.txt", super::session_log::timestamp_for(now));
     let path = dir.join(&name);
-    std::fs::write(&path, content).map_err(|source| KnownHostsError::Io {
-        path: path.clone(),
-        source,
+    // Create the snapshot owner-only in one step: a config dump can hold
+    // secrets, and a plain write-then-chmod leaves a window where it is
+    // group/world-readable under a permissive umask.
+    super::platform::write_private(&path, content.as_bytes()).map_err(|source| {
+        KnownHostsError::Io {
+            path: path.clone(),
+            source,
+        }
     })?;
 
     let (added, removed) = match previous {
