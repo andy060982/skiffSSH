@@ -47,13 +47,12 @@ pub fn reveal_file(path: &Path) -> std::io::Result<()> {
 /// from leaking into cross-platform code paths like key generation.
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
+    let var = std::env::var_os("USERPROFILE");
     #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
+    let var = std::env::var_os("HOME");
+    // Treat a set-but-EMPTY value as absent: an empty home would otherwise make
+    // ssh_keygen write ".ssh" relative to the current directory rather than fail.
+    var.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// Best-effort user "Documents" directory for exports. Falls back to the home

@@ -72,9 +72,17 @@ export function parentPath(side: PaneSide, path: string): string {
     return cut <= 0 ? '/' : trimmed.slice(0, cut)
   }
   const trimmed = path.replace(/\\+$/, '')
+  // Drive root ("C:" or "C:\") stays at the drive root — "C:" alone is a
+  // drive-*relative* path, not the root, so keep the trailing separator.
+  if (/^[A-Za-z]:$/.test(trimmed)) return `${trimmed}\\`
+  // UNC share root ("\\server\share") — there is nothing above the share, so
+  // stay put rather than returning the invalid "\\server".
+  if (/^\\\\[^\\]+\\[^\\]+$/.test(trimmed)) return trimmed
   const cut = trimmed.lastIndexOf('\\')
-  // "C:" alone is not a valid path; keep the trailing separator on a drive root.
-  return cut <= 2 ? `${trimmed.slice(0, 3)}` : trimmed.slice(0, cut)
+  if (cut < 0) return `${trimmed}\\`
+  const parent = trimmed.slice(0, cut)
+  // Going up to a drive root keeps its separator ("C:\dir" -> "C:\").
+  return /^[A-Za-z]:$/.test(parent) ? `${parent}\\` : parent
 }
 
 export function basename(side: PaneSide, path: string): string {

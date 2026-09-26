@@ -276,10 +276,17 @@ async fn local_list(path: String) -> CmdResult<DirListing> {
         .canonicalize()
         .map(|p| {
             // Strip the \\?\ verbatim prefix Windows adds; it is correct but
-            // renders badly in a path bar.
-            p.to_string_lossy()
-                .trim_start_matches(r"\\?\")
-                .to_string()
+            // renders badly in a path bar. A UNC path canonicalises to
+            // \\?\UNC\server\share (which IS \\server\share) — strip that to its
+            // real form rather than leaving the invalid "UNC\server\share".
+            let s = p.to_string_lossy();
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{rest}")
+            } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                rest.to_string()
+            } else {
+                s.to_string()
+            }
         })
         .unwrap_or_else(|_| path.clone());
 

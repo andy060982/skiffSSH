@@ -55,7 +55,7 @@ export function SftpView({
 }) {
   const [ratio, setRatio] = useState(0.5)
   const [focus, setFocus] = useState<PaneSide>('local')
-  const [localPath, setLocalPath] = useState(savedPaths?.local ?? defaultLocal())
+  const [localPath, setLocalPath] = useState(savedPaths?.local || defaultLocal())
   const [remotePath, setRemotePath] = useState(savedPaths?.remote ?? DEFAULT_REMOTE)
   // Current paths for the drop handler, which subscribes once.
   const remoteRef = useRef(remotePath)
@@ -331,7 +331,7 @@ export function SftpView({
           <FilePane
             side="local"
             sessionId={session.id}
-            initialPath={savedPaths?.local ?? defaultLocal()}
+            initialPath={savedPaths?.local || defaultLocal()}
             focused={focus === 'local'}
             onFocus={() => setFocus('local')}
             onPathChange={setLocalPath}
