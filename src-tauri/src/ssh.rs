@@ -1241,6 +1241,18 @@ async fn keyboard_interactive_with_password(
                 })
             }
             Kb::InfoRequest { prompts, .. } => {
+                // Only a HIDDEN prompt gets the password; an echoed prompt (an
+                // OTP/challenge we can't know) gets an empty answer. `password`
+                // is borrowed from the caller's Zeroizing buffer, and we keep no
+                // copy of our own beyond the vector handed to russh below.
+                //
+                // Caveat, documented rather than hidden: russh 0.63's
+                // `..._respond` takes `Vec<String>` by value and moves it into
+                // its internal message queue, so that one transient plaintext
+                // copy lives inside russh for the round-trip and cannot be
+                // zeroized from here. Fully closing that needs upstream russh to
+                // accept a zeroizing response type; there is no additional copy
+                // on Skiff's side.
                 let answers: Vec<String> = prompts
                     .iter()
                     .map(|p| if p.echo { String::new() } else { password.to_string() })
