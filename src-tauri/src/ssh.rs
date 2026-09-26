@@ -782,6 +782,16 @@ impl Registry {
             return copy_remote_file(&sftp, app, session_id, remote, local).await;
         }
 
+        // Everything from `local` downward is built from server-chosen names and
+        // is therefore untrusted; the folder that CONTAINS `local` is the one the
+        // user actually picked and is the trust boundary. Any pre-existing symlink
+        // or junction below it must not be followed. (`local` always has a parent
+        // here: `safe_local_component` above rejected an empty final component.)
+        let root = std::path::Path::new(local)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+
         let mut total = 0u64;
         let mut failed: Vec<String> = Vec::new();
         // Bound the walk so a malicious or misconfigured server advertising a
@@ -796,6 +806,12 @@ impl Registry {
                     "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
                 ));
                 break;
+            }
+            // Refuse to descend into (or create under) a linked ancestor before
+            // create_dir_all can follow it outside the destination.
+            if let Err(e) = reject_link_in_subtree(&root, std::path::Path::new(&ldir)) {
+                failed.push(format!("{ldir}: {e}"));
+                continue;
             }
             tokio::fs::create_dir_all(&ldir).await?;
             for entry in sftp.read_dir(&rdir).await? {
@@ -1429,6 +1445,68 @@ fn safe_local_component(name: &str) -> bool {
         && !is_windows_reserved(name)
 }
 
+/// True if `meta` describes a symlink or (on Windows) any reparse point such as
+/// a junction or mount point. `symlink_metadata().is_symlink()` alone misses
+/// NTFS junctions, which are reparse points but not "symlinks" — and a junction
+/// redirects a directory just as effectively, so a download must refuse it too.
+fn is_link_or_reparse(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
+/// Refuse if any component of `target` *below* the trusted `root` already exists
+/// on disk as a symlink or reparse point.
+///
+/// `safe_local_component` guarantees each name is a plain component, so `target`
+/// is structurally `root/comp1/comp2/...` and cannot use `..` or an absolute
+/// path to escape. The one remaining escape is an *existing local link* planted
+/// at one of those positions: a server tree containing `logs/` will silently
+/// write into `/etc` if `root/logs` is already a symlink to it, because
+/// `create_dir_all` and `File::create` follow links. Checking each existing
+/// level before we create or write closes that hole.
+///
+/// The trusted `root` itself (the folder the user picked) and its real ancestors
+/// are not re-checked — only the region built from server-supplied names is.
+/// The attacker here is the remote server choosing names, not a concurrent local
+/// process, so a check-then-create window is not a meaningful TOCTOU race.
+fn reject_link_in_subtree(root: &std::path::Path, target: &std::path::Path) -> Result<(), SshError> {
+    let rel = match target.strip_prefix(root) {
+        Ok(rel) => rel,
+        // A target that is not under root is itself an escape; refuse rather
+        // than silently checking nothing.
+        Err(_) => {
+            return Err(SshError::PartialTransfer(format!(
+                "refusing to write outside the destination: {}",
+                target.display()
+            )))
+        }
+    };
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if is_link_or_reparse(&meta) => {
+                return Err(SshError::PartialTransfer(format!(
+                    "refusing to follow a link in the download path: {}",
+                    cur.display()
+                )))
+            }
+            // Missing (will be created as a real dir/file) or a real entry: fine.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// True for Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9),
 /// matched case-insensitively and ignoring any extension — `NUL.txt` is still
 /// the NUL device. Creating such a file fails with a confusing OS error, so we
@@ -1701,7 +1779,7 @@ fn mode_string(permissions: Option<u32>, kind: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_local_component;
+    use super::{reject_link_in_subtree, safe_local_component};
 
     #[test]
     fn rejects_traversal_and_absolute_names() {
@@ -1727,5 +1805,35 @@ mod tests {
         assert!(safe_local_component("console.log"));
         assert!(safe_local_component("com10"));
         assert!(safe_local_component("nullable.rs"));
+    }
+
+    // A pre-existing local symlink in the download subtree is the escape #4
+    // guards against: `create_dir_all`/`File::create` would follow it out of the
+    // chosen folder. Symlink creation is a Unix-only primitive in std, so this
+    // test is gated to Unix; the Windows reparse-point path shares the code.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_ancestor_in_subtree() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("skiff-symtest-{}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // A plain, real subtree is accepted (nothing created yet — check is
+        // purely about existing links).
+        assert!(reject_link_in_subtree(&root, &root.join("a").join("b.txt")).is_ok());
+
+        // Plant `root/link` -> `outside`, then a target that routes through it.
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let via_link = link.join("evil.txt");
+        assert!(reject_link_in_subtree(&root, &via_link).is_err());
+
+        // A target outside root entirely is also refused.
+        assert!(reject_link_in_subtree(&root, &outside.join("x")).is_err());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
